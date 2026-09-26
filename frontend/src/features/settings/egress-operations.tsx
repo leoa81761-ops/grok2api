@@ -67,7 +67,9 @@ function defaultFallbacks(): Record<EgressScope, EgressFallbackConfigDTO> {
 }
 
 const defaultOperationsForm: Omit<EgressOperationsConfigDTO, "updatedAt"> = {
-  probeProvider: "cloudflare", probeIntervalSeconds: 900, autoAssignEnabled: false, autoBalanceEnabled: false, assignmentIntervalSeconds: 300, fallbacks: defaultFallbacks(),
+  probeProvider: "cloudflare", probeIntervalSeconds: 900, autoAssignEnabled: false, autoBalanceEnabled: false,
+  autoRemoveUnhealthyEnabled: false, autoRemoveHealthThreshold: 0.2, autoRemoveMinHealthyNodes: 3,
+  assignmentIntervalSeconds: 300, fallbacks: defaultFallbacks(),
 };
 
 function operationsFormFrom(value?: EgressOperationsConfigDTO): Omit<EgressOperationsConfigDTO, "updatedAt"> {
@@ -79,6 +81,9 @@ function operationsFormFrom(value?: EgressOperationsConfigDTO): Omit<EgressOpera
     probeIntervalSeconds: value.probeIntervalSeconds,
     autoAssignEnabled: value.autoAssignEnabled,
     autoBalanceEnabled: value.autoBalanceEnabled,
+    autoRemoveUnhealthyEnabled: value.autoRemoveUnhealthyEnabled,
+    autoRemoveHealthThreshold: value.autoRemoveHealthThreshold,
+    autoRemoveMinHealthyNodes: value.autoRemoveMinHealthyNodes,
     assignmentIntervalSeconds: value.assignmentIntervalSeconds,
     fallbacks: {
       grok_build: { ...defaults.grok_build, ...value.fallbacks.grok_build },
@@ -191,6 +196,19 @@ export function EgressAutomation({ scopeLabel }: { scopeLabel: (scope: EgressSco
             <AutomationRow controlId="egress-auto-balance" label={t("settings.egress.autoBalance")} description={t("settings.egress.autoBalanceHelp")}>
               <div className="flex h-8 items-center"><Switch id="egress-auto-balance" checked={operationsForm.autoBalanceEnabled} onCheckedChange={(autoBalanceEnabled) => setOperationsDraft({ ...operationsForm, autoBalanceEnabled })} /></div>
             </AutomationRow>
+            <AutomationRow controlId="egress-auto-remove" label={t("settings.egress.autoRemoveUnhealthy")} description={t("settings.egress.autoRemoveUnhealthyHelp")}>
+              <div className="flex h-8 items-center"><Switch id="egress-auto-remove" checked={operationsForm.autoRemoveUnhealthyEnabled} onCheckedChange={(autoRemoveUnhealthyEnabled) => setOperationsDraft({ ...operationsForm, autoRemoveUnhealthyEnabled })} /></div>
+            </AutomationRow>
+            {operationsForm.autoRemoveUnhealthyEnabled ? (
+              <>
+                <AutomationRow controlId="egress-auto-remove-threshold" label={t("settings.egress.autoRemoveHealthThreshold")} description={t("settings.egress.autoRemoveHealthThresholdHelp")}>
+                  <Input id="egress-auto-remove-threshold" type="number" min={0.01} max={1} step={0.05} value={operationsForm.autoRemoveHealthThreshold} onChange={(event) => setOperationsDraft({ ...operationsForm, autoRemoveHealthThreshold: Number(event.target.value) })} />
+                </AutomationRow>
+                <AutomationRow controlId="egress-auto-remove-min-healthy" label={t("settings.egress.autoRemoveMinHealthyNodes")} description={t("settings.egress.autoRemoveMinHealthyNodesHelp")}>
+                  <Input id="egress-auto-remove-min-healthy" type="number" min={0} max={1000} value={operationsForm.autoRemoveMinHealthyNodes} onChange={(event) => setOperationsDraft({ ...operationsForm, autoRemoveMinHealthyNodes: Number(event.target.value) })} />
+                </AutomationRow>
+              </>
+            ) : null}
             <div className="pt-4">
               <div className="flex items-center gap-1.5 px-0.5">
                 <h3 className="text-sm font-medium tracking-tight">{t("settings.egress.fallback")}</h3>

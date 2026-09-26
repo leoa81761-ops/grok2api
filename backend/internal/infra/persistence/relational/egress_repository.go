@@ -926,10 +926,21 @@ func fromEgressSubscriptionSourceDomain(value egress.SubscriptionSource) egressS
 }
 
 func toEgressOperationsConfigDomain(row egressOperationsConfigModel) egress.OperationsConfig {
+	threshold := row.AutoRemoveHealthThreshold
+	if threshold <= 0 || threshold > 1 {
+		threshold = egress.DefaultAutoRemoveHealthThreshold
+	}
+	floor := row.AutoRemoveMinHealthyNodes
+	if floor < 0 {
+		floor = egress.DefaultAutoRemoveMinHealthyNodes
+	}
 	return egress.OperationsConfig{
 		ProbeProvider:        egress.ProbeProvider(row.ProbeProvider).Normalized(),
 		ProbeIntervalSeconds: row.ProbeIntervalSeconds, AutoAssignEnabled: row.AutoAssignEnabled, AutoBalanceEnabled: row.AutoBalanceEnabled,
-		AssignmentIntervalSeconds: row.AssignmentIntervalSeconds,
+		AssignmentIntervalSeconds:  row.AssignmentIntervalSeconds,
+		AutoRemoveUnhealthyEnabled: row.AutoRemoveUnhealthyEnabled,
+		AutoRemoveHealthThreshold:  threshold,
+		AutoRemoveMinHealthyNodes:  floor,
 		Fallbacks: map[egress.Scope]egress.FallbackConfig{
 			egress.ScopeBuild:        {Mode: egress.FallbackMode(row.BuildFallbackMode).Normalized(), NodeID: row.BuildFallbackNodeID},
 			egress.ScopeWeb:          {Mode: egress.FallbackMode(row.WebFallbackMode).Normalized(), NodeID: row.WebFallbackNodeID},
@@ -950,7 +961,9 @@ func fromEgressOperationsConfigDomain(value egress.OperationsConfig) egressOpera
 	return egressOperationsConfigModel{
 		ID: 1, ProbeProvider: string(value.ProbeProvider.Normalized()), ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
 		AutoBalanceEnabled: value.AutoBalanceEnabled, AssignmentIntervalSeconds: value.AssignmentIntervalSeconds,
-		BuildFallbackMode: string(buildFallback.Mode), BuildFallbackNodeID: buildFallback.NodeID,
+		AutoRemoveUnhealthyEnabled: value.AutoRemoveUnhealthyEnabled, AutoRemoveHealthThreshold: value.AutoRemoveHealthThreshold,
+		AutoRemoveMinHealthyNodes: value.AutoRemoveMinHealthyNodes,
+		BuildFallbackMode:         string(buildFallback.Mode), BuildFallbackNodeID: buildFallback.NodeID,
 		WebFallbackMode: string(webFallback.Mode), WebFallbackNodeID: webFallback.NodeID,
 		ConsoleFallbackMode: string(consoleFallback.Mode), ConsoleFallbackNodeID: consoleFallback.NodeID,
 		WebAssetFallbackMode: string(webAssetFallback.Mode), WebAssetFallbackNodeID: webAssetFallback.NodeID,

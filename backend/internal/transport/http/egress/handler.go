@@ -1230,12 +1230,15 @@ type probeBatchRequest struct {
 }
 
 type operationsConfigRequest struct {
-	ProbeProvider             string                               `json:"probeProvider"`
-	ProbeIntervalSeconds      int                                  `json:"probeIntervalSeconds"`
-	AutoAssignEnabled         bool                                 `json:"autoAssignEnabled"`
-	AutoBalanceEnabled        bool                                 `json:"autoBalanceEnabled"`
-	AssignmentIntervalSeconds int                                  `json:"assignmentIntervalSeconds"`
-	Fallbacks                 map[string]operationsFallbackRequest `json:"fallbacks"`
+	ProbeProvider              string                               `json:"probeProvider"`
+	ProbeIntervalSeconds       int                                  `json:"probeIntervalSeconds"`
+	AutoAssignEnabled          bool                                 `json:"autoAssignEnabled"`
+	AutoBalanceEnabled         bool                                 `json:"autoBalanceEnabled"`
+	AutoRemoveUnhealthyEnabled bool                                 `json:"autoRemoveUnhealthyEnabled"`
+	AutoRemoveHealthThreshold  float64                              `json:"autoRemoveHealthThreshold"`
+	AutoRemoveMinHealthyNodes  int                                  `json:"autoRemoveMinHealthyNodes"`
+	AssignmentIntervalSeconds  int                                  `json:"assignmentIntervalSeconds"`
+	Fallbacks                  map[string]operationsFallbackRequest `json:"fallbacks"`
 }
 
 type operationsFallbackRequest struct {
@@ -1244,13 +1247,16 @@ type operationsFallbackRequest struct {
 }
 
 type operationsConfigResponse struct {
-	ProbeProvider             string                                `json:"probeProvider"`
-	ProbeIntervalSeconds      int                                   `json:"probeIntervalSeconds"`
-	AutoAssignEnabled         bool                                  `json:"autoAssignEnabled"`
-	AutoBalanceEnabled        bool                                  `json:"autoBalanceEnabled"`
-	AssignmentIntervalSeconds int                                   `json:"assignmentIntervalSeconds"`
-	Fallbacks                 map[string]operationsFallbackResponse `json:"fallbacks"`
-	UpdatedAt                 time.Time                             `json:"updatedAt"`
+	ProbeProvider              string                                `json:"probeProvider"`
+	ProbeIntervalSeconds       int                                   `json:"probeIntervalSeconds"`
+	AutoAssignEnabled          bool                                  `json:"autoAssignEnabled"`
+	AutoBalanceEnabled         bool                                  `json:"autoBalanceEnabled"`
+	AutoRemoveUnhealthyEnabled bool                                  `json:"autoRemoveUnhealthyEnabled"`
+	AutoRemoveHealthThreshold  float64                               `json:"autoRemoveHealthThreshold"`
+	AutoRemoveMinHealthyNodes  int                                   `json:"autoRemoveMinHealthyNodes"`
+	AssignmentIntervalSeconds  int                                   `json:"assignmentIntervalSeconds"`
+	Fallbacks                  map[string]operationsFallbackResponse `json:"fallbacks"`
+	UpdatedAt                  time.Time                             `json:"updatedAt"`
 }
 
 type operationsFallbackResponse struct {
@@ -1262,6 +1268,8 @@ func (value operationsConfigRequest) input() (egressapp.OperationsConfigInput, e
 	result := egressapp.OperationsConfigInput{
 		ProbeProvider: egressdomain.ProbeProvider(strings.TrimSpace(value.ProbeProvider)), ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
 		AutoBalanceEnabled: value.AutoBalanceEnabled, AssignmentIntervalSeconds: value.AssignmentIntervalSeconds,
+		AutoRemoveUnhealthyEnabled: value.AutoRemoveUnhealthyEnabled, AutoRemoveHealthThreshold: value.AutoRemoveHealthThreshold,
+		AutoRemoveMinHealthyNodes: value.AutoRemoveMinHealthyNodes,
 	}
 	if value.Fallbacks == nil {
 		return result, nil
@@ -1313,7 +1321,9 @@ func newOperationsConfigResponse(value egressdomain.OperationsConfig) operations
 	return operationsConfigResponse{
 		ProbeProvider: string(value.ProbeProvider.Normalized()), ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
 		AutoBalanceEnabled: value.AutoBalanceEnabled, AssignmentIntervalSeconds: value.AssignmentIntervalSeconds,
-		Fallbacks: fallbacks, UpdatedAt: value.UpdatedAt,
+		AutoRemoveUnhealthyEnabled: value.AutoRemoveUnhealthyEnabled, AutoRemoveHealthThreshold: value.AutoRemoveHealthThreshold,
+		AutoRemoveMinHealthyNodes: value.AutoRemoveMinHealthyNodes,
+		Fallbacks:                 fallbacks, UpdatedAt: value.UpdatedAt,
 	}
 }
 

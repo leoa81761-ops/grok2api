@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -92,7 +94,12 @@ type OperationsConfigInput struct {
 	AutoAssignEnabled         bool
 	AutoBalanceEnabled        bool
 	AssignmentIntervalSeconds int
-	Fallbacks                 map[domain.Scope]FallbackConfigInput
+	// AutoRemove* mirror domain.OperationsConfig; the zero values keep the
+	// configured defaults so older clients that omit the fields stay valid.
+	AutoRemoveUnhealthyEnabled bool
+	AutoRemoveHealthThreshold  float64
+	AutoRemoveMinHealthyNodes  int
+	Fallbacks                  map[domain.Scope]FallbackConfigInput
 }
 
 type FallbackConfigInput struct {
@@ -410,10 +417,20 @@ func (s *Service) UpdateOperationsConfig(ctx context.Context, input OperationsCo
 			return domain.OperationsConfig{}, err
 		}
 	}
+	threshold := input.AutoRemoveHealthThreshold
+	if threshold <= 0 || threshold > 1 {
+		threshold = domain.DefaultAutoRemoveHealthThreshold
+	}
+	floor := input.AutoRemoveMinHealthyNodes
+	if floor < 0 || floor > 1000 {
+		return domain.OperationsConfig{}, fmt.Errorf("%w: 保底健康节点数必须在 0 到 1000 之间", ErrInvalidInput)
+	}
 	saved, err := operations.SaveEgressOperationsConfig(ctx, domain.OperationsConfig{
 		ProbeProvider: probeProvider, ProbeIntervalSeconds: input.ProbeIntervalSeconds, AutoAssignEnabled: input.AutoAssignEnabled,
 		AutoBalanceEnabled: input.AutoBalanceEnabled, AssignmentIntervalSeconds: input.AssignmentIntervalSeconds,
-		Fallbacks: fallbacks, UpdatedAt: time.Now().UTC(),
+		AutoRemoveUnhealthyEnabled: input.AutoRemoveUnhealthyEnabled, AutoRemoveHealthThreshold: threshold,
+		AutoRemoveMinHealthyNodes: floor,
+		Fallbacks:                 fallbacks, UpdatedAt: time.Now().UTC(),
 	})
 	if errors.Is(err, repository.ErrEgressFallbackInUse) {
 		return domain.OperationsConfig{}, fmt.Errorf("%w: 固定回退节点必须保持启用且可用", ErrInvalidInput)
@@ -422,6 +439,91 @@ func (s *Service) UpdateOperationsConfig(ctx context.Context, input OperationsCo
 		s.invalidateOperationsConfig()
 	}
 	return saved, err
+}
+
+// AutoRemoveResult summarises one automatic unhealthy-node removal pass.
+type AutoRemoveResult struct {
+	Scanned int
+	Removed int
+}
+
+// AutoRemoveUnhealthyNodes deletes nodes whose request health sits below the
+// configured threshold, whether or not they are currently enabled: the egress
+// table should not keep below-threshold rows around, and a node the quality
+// guard already disabled would otherwise never become eligible. Each scope
+// always keeps AutoRemoveMinHealthyNodes healthy enabled nodes, so a pass can
+// never empty a scope. Node deletion clears the account bindings in the same
+// transaction, so the freed accounts are re-placed by the next rebalance.
+func (s *Service) AutoRemoveUnhealthyNodes(ctx context.Context) (AutoRemoveResult, error) {
+	result := AutoRemoveResult{}
+	operations, err := s.operationsRepository()
+	if err != nil {
+		return result, err
+	}
+	config, err := operations.GetEgressOperationsConfig(ctx)
+	if err != nil {
+		return result, err
+	}
+	if !config.AutoRemoveUnhealthyEnabled {
+		return result, nil
+	}
+	threshold := config.AutoRemoveHealthThreshold
+	if threshold <= 0 || threshold > 1 {
+		threshold = domain.DefaultAutoRemoveHealthThreshold
+	}
+	floor := config.AutoRemoveMinHealthyNodes
+	if floor < 0 {
+		floor = domain.DefaultAutoRemoveMinHealthyNodes
+	}
+	values, err := s.repository.ListEgressNodes(ctx, "", repository.SortQuery{})
+	if err != nil {
+		return result, err
+	}
+	result.Scanned = len(values)
+	byScope := make(map[domain.Scope][]domain.Node, 5)
+	for _, value := range values {
+		byScope[value.Scope] = append(byScope[value.Scope], value)
+	}
+	candidates := make([]uint64, 0)
+	for scope, scoped := range byScope {
+		healthy := 0
+		unhealthy := make([]domain.Node, 0, len(scoped))
+		for _, node := range scoped {
+			if node.Health < threshold || node.ProbeStatus == domain.ProbeStatusUnhealthy {
+				unhealthy = append(unhealthy, node)
+				continue
+			}
+			if node.Enabled {
+				healthy++
+			}
+		}
+		budget := healthy - floor
+		if budget <= 0 {
+			continue
+		}
+		sort.Slice(unhealthy, func(i, j int) bool { return unhealthy[i].Health < unhealthy[j].Health })
+		if len(unhealthy) > budget {
+			unhealthy = unhealthy[:budget]
+		}
+		ids := make([]uint64, 0, len(unhealthy))
+		for _, node := range unhealthy {
+			ids = append(ids, node.ID)
+		}
+		if len(ids) > 0 {
+			log.Printf("egress auto-remove: scope=%s healthy=%d floor=%d threshold=%.2f removing=%d ids=%v",
+				scope, healthy, floor, threshold, len(ids), ids)
+		}
+		candidates = append(candidates, ids...)
+	}
+	if len(candidates) == 0 {
+		return result, nil
+	}
+	removed, err := s.DeleteMany(ctx, candidates)
+	result.Removed = removed
+	if err == nil {
+		log.Printf("egress auto-remove: removed=%d of candidates=%d", removed, len(candidates))
+	}
+	return result, err
 }
 
 func (s *Service) validateFallbacks(ctx context.Context, current domain.OperationsConfig, input map[domain.Scope]FallbackConfigInput) (map[domain.Scope]domain.FallbackConfig, error) {

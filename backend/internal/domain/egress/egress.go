@@ -238,6 +238,15 @@ func (value ProbeProvider) Normalized() ProbeProvider {
 	return value
 }
 
+const (
+	// DefaultAutoRemoveHealthThreshold and DefaultAutoRemoveMinHealthyNodes give
+	// the zero value of a legacy configuration row the same safe meaning the
+	// defaults have: only clearly unhealthy nodes are candidates, and a scope
+	// always keeps a floor of healthy nodes.
+	DefaultAutoRemoveHealthThreshold = 0.2
+	DefaultAutoRemoveMinHealthyNodes = 3
+)
+
 // OperationsConfig controls background probe, account assignment, and egress
 // fallback work. It defaults to a conservative disabled state for mutations
 // and fallback routing.
@@ -247,6 +256,17 @@ type OperationsConfig struct {
 	AutoAssignEnabled         bool
 	AutoBalanceEnabled        bool
 	AssignmentIntervalSeconds int
+	// AutoRemoveUnhealthyEnabled deletes enabled nodes whose request health
+	// stays below AutoRemoveHealthThreshold. Deleting the node also clears its
+	// account bindings, so those accounts are re-placed on healthy nodes.
+	AutoRemoveUnhealthyEnabled bool
+	// AutoRemoveHealthThreshold is the relative health floor in (0, 1]. A node
+	// whose Health is below it (or whose probe is failing) becomes a removal
+	// candidate.
+	AutoRemoveHealthThreshold float64
+	// AutoRemoveMinHealthyNodes is the per-scope floor of healthy nodes that is
+	// always kept, so an automatic pass can never empty a scope.
+	AutoRemoveMinHealthyNodes int
 	Fallbacks                 map[Scope]FallbackConfig
 	UpdatedAt                 time.Time
 }
@@ -256,6 +276,8 @@ func DefaultOperationsConfig() OperationsConfig {
 		ProbeProvider:             ProbeProviderCloudflare,
 		ProbeIntervalSeconds:      900,
 		AssignmentIntervalSeconds: 300,
+		AutoRemoveHealthThreshold: DefaultAutoRemoveHealthThreshold,
+		AutoRemoveMinHealthyNodes: DefaultAutoRemoveMinHealthyNodes,
 		Fallbacks: map[Scope]FallbackConfig{
 			ScopeBuild:        {Mode: FallbackModeNone},
 			ScopeWeb:          {Mode: FallbackModeNone},

@@ -440,6 +440,11 @@ func (s *Service) RunMaintenance(ctx context.Context) error {
 			resultErr = errors.Join(resultErr, probeErr)
 		}
 	}
+	if config.AutoRemoveUnhealthyEnabled {
+		if _, removeErr := s.AutoRemoveUnhealthyNodes(ctx); removeErr != nil {
+			resultErr = errors.Join(resultErr, removeErr)
+		}
+	}
 	if config.AutoAssignEnabled || config.AutoBalanceEnabled {
 		s.mu.Lock()
 		due := !s.assignmentRunning && (s.lastAssignmentRun.IsZero() || time.Since(s.lastAssignmentRun) >= time.Duration(config.AssignmentIntervalSeconds)*time.Second)
