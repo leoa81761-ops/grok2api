@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -369,6 +371,34 @@ func parseVideoStream(response *http.Response, progress func(int)) (provider.Vid
 	var result provider.VideoResult
 	var postID string
 	handle := func(root map[string]any) (bool, error) {
+		// TEMPORARY DEBUG (2026-10-24): dump upstream video stream shape so we can
+		// tell a real generation event from a gallery attachment. Remove before PR.
+		if debugRaw, ok := root["result"].(map[string]any); ok {
+			if resp, ok := debugRaw["response"].(map[string]any); ok {
+				keys := make([]string, 0, len(resp))
+				for k := range resp {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				log.Printf("[VIDEO-DEBUG] response keys=%v", keys)
+				if stream, ok := resp["streamingVideoGenerationResponse"].(map[string]any); ok {
+					log.Printf("[VIDEO-DEBUG] stream progress=%v videoPostId=%v videoUrl=%v", stream["progress"], stream["videoPostId"], stream["videoUrl"])
+				}
+				if modelResp, ok := resp["modelResponse"].(map[string]any); ok {
+					log.Printf("[VIDEO-DEBUG] modelResponse keys=%v", func() []string {
+						out := make([]string, 0, len(modelResp))
+						for k := range modelResp {
+							out = append(out, k)
+						}
+						sort.Strings(out)
+						return out
+					}())
+					if att, ok := modelResp["fileAttachments"].([]any); ok {
+						log.Printf("[VIDEO-DEBUG] fileAttachments=%v", att)
+					}
+				}
+			}
+		}
 		if errorValue, ok := root["error"].(map[string]any); ok {
 			return false, webMediaStreamError(errorValue)
 		}
