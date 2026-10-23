@@ -785,7 +785,12 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 func videoQuotaMode(providerValue account.Provider, catalogMode, resolution string) string {
 	if providerValue == account.ProviderWeb && catalogMode == account.QuotaModeWebVideo {
 		resolution = strings.ToLower(strings.TrimSpace(resolution))
-		if resolution == "" || resolution == "720p" {
+		// 2026-10-24 experiment: free Web accounts are entitled to 6s 480p video,
+		// but 480p currently maps to the generic QuotaModeWebVideo bucket which no
+		// basic account serves, so every 480p request is rejected with
+		// "当前账号池不支持该模型". Treat 480p as the same quota bucket as the free
+		// 720p one so the request reaches the account and upstream sees resolution=480p.
+		if resolution == "" || resolution == "720p" || resolution == "480p" {
 			return account.QuotaModeWebVideo720p
 		}
 	}
