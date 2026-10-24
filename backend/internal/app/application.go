@@ -468,7 +468,10 @@ func maxBatchConcurrency(value config.BatchConfig) int {
 func webProviderConfig(cfg config.Config) webprovider.Config {
 	return webprovider.Config{
 		BaseURL: cfg.Provider.Web.BaseURL, QuotaTimeoutSeconds: int(cfg.Provider.Web.QuotaTimeout.Value().Seconds()),
-		StatsigMode: cfg.Provider.Web.StatsigMode, StatsigManualValue: cfg.Provider.Web.StatsigManualValue,
+		// 公开地址用于识别「图片 URL 指向网关自己」的请求：这类下载要优先读本地
+		// 媒体存储、否则直连，不能走账号出口代理（代理侧 TLS 证书不匹配）。
+		PublicBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(),
+		StatsigMode:   cfg.Provider.Web.StatsigMode, StatsigManualValue: cfg.Provider.Web.StatsigManualValue,
 		StatsigSignerURL:   cfg.Provider.Web.StatsigSignerURL,
 		ChatTimeoutSeconds: int(cfg.Provider.Web.ChatTimeout.Value().Seconds()), StreamIdleTimeoutSeconds: int(cfg.Provider.Web.StreamIdleTimeout.Value().Seconds()),
 		ImageTimeoutSeconds: int(cfg.Provider.Web.ImageTimeout.Value().Seconds()),

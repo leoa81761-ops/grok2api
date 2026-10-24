@@ -23,6 +23,27 @@ func (l *Lease) DoPinnedHTTPS(request *http.Request, serverName string) (*http.R
 	if l == nil {
 		return nil, errors.New("出口租约未初始化")
 	}
+	client, err := newValidatedPinnedHTTPSClient(l.ProxyURL, request, serverName)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(request)
+}
+
+// DoPinnedHTTPSDirect 与 DoPinnedHTTPS 使用完全相同的地址/Host/TLS 校验，
+// 但不经过任何出口代理。用于访问本服务自己的公开域名：经账号出口代理访问
+// 自己的域名会因代理侧证书/SNI 不匹配而失败，而且没有必要占用账号出口。
+func DoPinnedHTTPSDirect(request *http.Request, serverName string) (*http.Response, error) {
+	client, err := newValidatedPinnedHTTPSClient("", request, serverName)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(request)
+}
+
+// newValidatedPinnedHTTPSClient 校验「URL 主机是已校验公网 IP + Host 与
+// TLS ServerName 一致 + HTTPS 443」，再按 proxyURL 是否为空返回代理/直连客户端。
+func newValidatedPinnedHTTPSClient(proxyURL string, request *http.Request, serverName string) (*http.Client, error) {
 	if request == nil || request.URL == nil || request.URL.Scheme != "https" || request.URL.Port() != "443" {
 		return nil, errors.New("固定地址请求必须使用 HTTPS 443")
 	}
@@ -39,11 +60,7 @@ func (l *Lease) DoPinnedHTTPS(request *http.Request, serverName string) (*http.R
 	if err != nil || strings.TrimSuffix(strings.ToLower(hostURL.Hostname()), ".") != serverName {
 		return nil, errors.New("固定地址请求的 Host 与 TLS ServerName 不一致")
 	}
-	client, err := newPinnedHTTPSClient(l.ProxyURL, serverName, nil)
-	if err != nil {
-		return nil, err
-	}
-	return client.Do(request)
+	return newPinnedHTTPSClient(proxyURL, serverName, nil)
 }
 
 func newPinnedHTTPSClient(proxyURL, serverName string, tlsConfig *tls.Config) (*http.Client, error) {

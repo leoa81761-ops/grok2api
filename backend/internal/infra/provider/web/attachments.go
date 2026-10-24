@@ -106,6 +106,22 @@ func (a *Adapter) loadChatImage(ctx context.Context, lease *egress.Lease, input 
 	if strings.HasPrefix(strings.ToLower(input), "data:") {
 		return parseChatImageDataURI(input, maxBytes)
 	}
+	// 本服务自己发布的图片（publicBaseURL + /v1/media/images/<id>）不进账号出口：
+	// 优先直接读本地媒体存储，没有本地副本时才直连下载。经出口代理访问自己的
+	// 公开域名会因代理侧 TLS 证书不匹配失败（生产实测），而且没必要把自家图片
+	// 的往返也挂到账号出口上。
+	if assetID, ok := a.ownMediaImageAssetID(input); ok {
+		if image, found, err := a.loadLocalMediaImage(ctx, assetID, maxBytes); found {
+			if err != nil {
+				return provider.ImageInput{}, err
+			}
+			return image, nil
+		}
+		return a.ownHostImages.LoadOwnHostImage(ctx, input, maxBytes)
+	}
+	if a.isOwnHostURL(input) {
+		return a.ownHostImages.LoadOwnHostImage(ctx, input, maxBytes)
+	}
 	target, err := validateRemoteImageURL(ctx, input)
 	if err != nil {
 		return provider.ImageInput{}, err
@@ -127,18 +143,24 @@ func (a *Adapter) loadChatImage(ctx context.Context, lease *egress.Lease, input 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return provider.ImageInput{}, fmt.Errorf("%w: 下载地址返回 %d", errInvalidChatImage, response.StatusCode)
 	}
-	if response.ContentLength > maxBytes {
+	return readImageResponse(response.Body, response.ContentLength, response.Header.Get("Content-Type"), target.originalURL, maxBytes)
+}
+
+// readImageResponse 把已经建立的图片响应读成 ImageInput，统一做大小与格式校验；
+// 外部图片（经出口）与自有域名直连共用同一套约束。
+func readImageResponse(body io.Reader, contentLength int64, contentType string, source *url.URL, maxBytes int64) (provider.ImageInput, error) {
+	if contentLength > maxBytes {
 		return provider.ImageInput{}, fmt.Errorf("%w: 图片超过 %d MiB", errInvalidChatImage, maxBytes>>20)
 	}
-	raw, err := io.ReadAll(io.LimitReader(response.Body, maxBytes+1))
+	raw, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
 	if err != nil || int64(len(raw)) > maxBytes {
 		return provider.ImageInput{}, fmt.Errorf("%w: 下载失败或图片超过 %d MiB", errInvalidChatImage, maxBytes>>20)
 	}
-	mimeType, err := validatedImageMIME(raw, response.Header.Get("Content-Type"))
+	mimeType, err := validatedImageMIME(raw, contentType)
 	if err != nil {
 		return provider.ImageInput{}, err
 	}
-	return provider.ImageInput{Filename: imageFilename(target.originalURL, mimeType), MIMEType: mimeType, Data: raw}, nil
+	return provider.ImageInput{Filename: imageFilename(source, mimeType), MIMEType: mimeType, Data: raw}, nil
 }
 
 func (a *Adapter) loadChatFile(ctx context.Context, lease *egress.Lease, input, filename string, maxBytes int64) (provider.ImageInput, error) {
