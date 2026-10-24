@@ -96,7 +96,7 @@ class ClassificationTests(unittest.TestCase):
         classification, reason, speed, _ = quality_guard.classify_audit({**base, "reasoningTokens": 80}, cfg)
         self.assertEqual((classification, reason), ("healthy", "within_threshold"))
         self.assertAlmostEqual(speed, 100.0)
-        short = {**base, "outputTokens": 50, "reasoningTokens": 0, "durationMs": 2500}
+        short = {**base, "outputTokens": 50, "reasoningTokens": 0, "durationMs": 3200}
         self.assertEqual(quality_guard.classify_audit(short, cfg)[:2], ("healthy", "within_threshold"))
         tiny = {**base, "outputTokens": 20, "reasoningTokens": 0, "durationMs": 2200}
         self.assertEqual(quality_guard.classify_audit(tiny, cfg)[0], "ignored")
@@ -153,6 +153,74 @@ class ClassificationTests(unittest.TestCase):
         failed = {**short, "statusCode": 502, "outputTokens": 100}
         self.assertEqual(quality_guard.classify_audit(short, cfg)[0], "ignored")
         self.assertEqual(quality_guard.classify_audit(failed, cfg)[0], "ignored")
+
+    def test_degraded_audit_rows_are_counted_instead_of_ignored(self):
+        cfg = config()
+        base = {"provider": "grok_build", "streaming": True, "statusCode": 200}
+        self.assertEqual(
+            quality_guard.classify_audit({**base, "errorCode": "quality_degraded", "outputTokens": 0}, cfg),
+            ("degraded", "quality_degraded", 0.0, 0),
+        )
+        self.assertEqual(
+            quality_guard.classify_audit({**base, "statusCode": 503, "errorCode": "quality_degraded_no_account"}, cfg),
+            ("degraded", "quality_degraded", 0.0, 0),
+        )
+        self.assertEqual(
+            quality_guard.classify_audit({**base, "errorCode": "upstream_stream_incomplete", "outputTokens": 64}, cfg),
+            ("degraded", "upstream_stream_incomplete", 0.0, 64),
+        )
+        # Unrelated transport/quota failures must not enter quality statistics.
+        self.assertEqual(quality_guard.classify_audit({**base, "statusCode": 502, "errorCode": "upstream_quota_exhausted"}, cfg)[0], "ignored")
+        self.assertEqual(quality_guard.classify_audit({**base, "statusCode": 429}, cfg)[0], "ignored")
+
+    def test_missing_first_token_rows_are_degrade_evidence(self):
+        cfg = config()
+        value = {"provider": "grok_build", "streaming": True, "statusCode": 200, "durationMs": 18000, "outputTokens": 0}
+        self.assertEqual(quality_guard.classify_audit(value, cfg), ("degraded", "missing_first_token", 0.0, 0))
+        self.assertEqual(
+            quality_guard.classify_audit({**value, "outputTokens": 500}, cfg),
+            ("degraded", "missing_first_token", 0.0, 500),
+        )
+
+    def test_buffered_dump_window_skips_tps_levels(self):
+        cfg = config()
+        # 19:27 incident row: first_token == duration -> 96,000 Token/s artifact.
+        row = {
+            "provider": "grok_build", "streaming": True, "statusCode": 200,
+            "firstTokenMs": 7212, "durationMs": 7213, "outputTokens": 96, "reasoningTokens": 0,
+        }
+        self.assertEqual(
+            quality_guard.classify_audit(row, cfg),
+            ("ignored", "generation_window_below_minimum", 96000.0, 96),
+        )
+        # The configured minimumGenerationWindow wins; zero falls back to 1s.
+        self.assertEqual(
+            quality_guard.classify_audit(row, config(min_generation_ms=5000))[:2],
+            ("ignored", "generation_window_below_minimum"),
+        )
+        self.assertEqual(
+            quality_guard.classify_audit(row, config(min_generation_ms=0))[:2],
+            ("ignored", "generation_window_below_minimum"),
+        )
+        # Strict mode keeps its intentional short-window detection.
+        self.assertEqual(
+            quality_guard.classify_audit(row, config(fail_closed=True))[:2],
+            ("hard", "buffered_burst"),
+        )
+
+    def test_probe_short_generation_window_abstains_from_tps(self):
+        result = {
+            "expectedMatched": True, "outputTokens": 96, "reasoningTokens": 40,
+            "outputTokensPerSecond": 96000, "generationMs": 1,
+        }
+        self.assertEqual(
+            quality_guard.classify_result(result, config()),
+            ("healthy", "generation_window_below_minimum"),
+        )
+        self.assertEqual(
+            quality_guard.classify_result(result, config(fail_closed=True)),
+            ("hard", "buffered_burst"),
+        )
 
 
 class StateTests(unittest.TestCase):
@@ -459,7 +527,7 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(api.enabled_calls, [("1", False), ("1", True)])
             self.assertFalse(state["disabled_by_guard"])
             self.assertEqual(guard.state["statistics"]["active"], {
-                "total": 2, "healthy": 1, "soft": 0, "hard": 1, "errors": 0, "output_tokens": 200,
+                "total": 2, "healthy": 1, "soft": 0, "hard": 1, "degraded": 0, "errors": 0, "output_tokens": 200,
             })
             self.assertEqual(guard.state["statistics"]["actions"]["quarantined"], 1)
             self.assertEqual(guard.state["statistics"]["actions"]["restored"], 1)
@@ -1046,6 +1114,74 @@ class GuardTests(unittest.TestCase):
             guard.run_passive_cycle()
             self.assertEqual(api.quality_calls, [])
             self.assertEqual(api.enabled_calls, [("2", False)])
+
+    def test_passive_degraded_audit_is_counted_without_quarantine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive")
+            degraded = {
+                "id": "degraded-1", "requestId": "request-degraded-1", "qualityProbe": False,
+                "provider": "grok_build", "streaming": True, "statusCode": 200,
+                "outputTokens": 0, "reasoningTokens": 0, "durationMs": 18000,
+                "errorCode": "quality_degraded", "accountId": "101", "egressNodeId": "2",
+            }
+            api = FakeApi(self.nodes(), [], [
+                {"items": [], "hasMore": False, "nextCursor": ""},
+                {"items": [degraded], "hasMore": False, "nextCursor": ""},
+            ])
+            guard = quality_guard.Guard(cfg, api)
+            guard.run_passive_cycle()
+            guard.run_passive_cycle()
+            self.assertEqual(api.enabled_calls, [])
+            self.assertEqual(guard.state["statistics"]["passive"]["total"], 1)
+            self.assertEqual(guard.state["statistics"]["passive"]["degraded"], 1)
+            self.assertEqual(guard.state["statistics"]["passive"]["soft"], 0)
+            self.assertEqual(guard.state["statistics"]["passive"]["hard"], 0)
+            node = guard.state["nodes"]["2"]
+            self.assertFalse(node["disabled_by_guard"])
+            self.assertEqual(node["last_classification"], "degraded")
+            self.assertEqual(node["passive_degraded_strikes"], 1)
+
+    def test_passive_missing_first_token_audit_is_counted_without_quarantine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive")
+            withheld = {
+                "id": "withheld-1", "requestId": "request-withheld-1", "qualityProbe": False,
+                "provider": "grok_build", "streaming": True, "statusCode": 200,
+                "outputTokens": 500, "reasoningTokens": 0, "durationMs": 18000,
+                "accountId": "101", "egressNodeId": "2",
+            }
+            api = FakeApi(self.nodes(), [], [
+                {"items": [], "hasMore": False, "nextCursor": ""},
+                {"items": [withheld], "hasMore": False, "nextCursor": ""},
+            ])
+            guard = quality_guard.Guard(cfg, api)
+            guard.run_passive_cycle()
+            guard.run_passive_cycle()
+            self.assertEqual(api.enabled_calls, [])
+            self.assertEqual(guard.state["statistics"]["passive"]["degraded"], 1)
+            self.assertEqual(guard.state["nodes"]["2"]["passive_degraded_strikes"], 1)
+            self.assertFalse(guard.state["nodes"]["2"]["disabled_by_guard"])
+
+    def test_passive_buffered_dump_artifact_does_not_quarantine_node(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive")
+            artifact = {
+                "id": "artifact-1", "requestId": "request-artifact-1", "qualityProbe": False,
+                "provider": "grok_build", "streaming": True, "statusCode": 200,
+                "firstTokenMs": 7212, "durationMs": 7213,
+                "outputTokens": 96, "reasoningTokens": 0,
+                "accountId": "101", "egressNodeId": "2",
+            }
+            api = FakeApi(self.nodes(), [], [
+                {"items": [], "hasMore": False, "nextCursor": ""},
+                {"items": [artifact], "hasMore": False, "nextCursor": ""},
+            ])
+            guard = quality_guard.Guard(cfg, api)
+            guard.run_passive_cycle()
+            guard.run_passive_cycle()
+            self.assertEqual(api.enabled_calls, [])
+            self.assertEqual(guard.state["statistics"]["passive"]["total"], 0)
+            self.assertEqual(guard.state["statistics"]["passive"]["soft"], 0)
 
     def test_multiple_passive_hard_signals_only_quarantine_once(self):
         with tempfile.TemporaryDirectory() as directory:

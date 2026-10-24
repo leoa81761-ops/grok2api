@@ -26,20 +26,37 @@ your own traffic before allowing automatic quarantine.
    except when that tail is both shorter than the first-token wait and under
    1s: then the full duration is used so buffered thinking is not assigned to
    a few milliseconds.
-2. Active mode calls a quality-guard-only internal probe endpoint. The scoped
+2. The soft and hard Token/s levels only apply when the generation window
+   reaches `qualityGuard.minimumGenerationWindow` (one second by default; the
+   sidecar falls back to that constant when an older main service omits it from
+   the bootstrap). A buffered dump with `first token == duration` leaves a
+   1-9 ms "window" that reports 10^5 Token/s; that is a measurement artifact of
+   the buffer flush, so the TPS levels abstain instead of quarantining a healthy
+   node. `failClosed: true` keeps its intentional short-window detection.
+3. Audits that record degradation rather than a delivered response are counted
+   instead of dropped: an audit row whose `errorCode` is `quality_degraded`,
+   `quality_degraded_no_account`, or `upstream_stream_incomplete`, and a
+   successful streaming row that has no `firstTokenMs` (the stream was held
+   until completion or withheld entirely). These are recorded as `degraded`
+   observations: they update the node's observation state, the `degraded`
+   statistics counter, and the `passive_degraded_observed` event. A single
+   request-level observation does not disable a shared node; node disposition
+   is a rate decision that belongs to the gateway's degradation-attribution
+   layer.
+4. Active mode calls a quality-guard-only internal probe endpoint. The scoped
    credential cannot access account exports, administrator management, or the
    rest of the administrator API.
-3. grok2api prefers an account bound to that node. If none is schedulable, it
+5. grok2api prefers an account bound to that node. If none is schedulable, it
    borrows any healthy account while still forcing the physical request through
    the node under test, then sends a fixed streaming prompt. The backend pins
    the route to Grok Build even when another provider exposes the same public
    model name.
-4. The fixed probe checks output tokens, chunk cadence, first-token time,
+6. The fixed probe checks output tokens, chunk cadence, first-token time,
    instruction-marker compliance, and panel-equivalent output-token throughput.
-5. A production request at either passive TPS threshold quarantines the node
+7. A production request at either passive TPS threshold quarantines the node
    immediately and starts the hold. Active hard results quarantine immediately;
    active soft results must reach the configured strike count.
-6. Quarantined nodes remain available only to administrator probes. Recovery
+8. Quarantined nodes remain available only to administrator probes. Recovery
    records a generic connectivity probe for diagnosis, then uses the real
    model-quality probe as the authority before re-enabling the node.
 
@@ -72,11 +89,14 @@ credential, account-block, and quota signals retain their normal transitions.
 - `active`: run only fixed per-node probes at the configured interval.
 - `hybrid`: enable both detectors. This is the recommended default.
 
-Passive monitoring ignores non-streaming requests, failed requests, responses
-with fewer than 32 output tokens, and audits created by the guard's own client
-key. On first startup it records a baseline without replaying historical
-anomalies. Cursor pagination and a persistent bounded ID set prevent duplicate
-processing across polls and restarts.
+Passive monitoring ignores non-streaming requests, unrelated failures, responses
+with fewer than 32 output tokens, samples shorter than the configured generation
+window, and audits created by the guard's own client key. Degradation-labelled
+audits and rows without a first token are counted as `degraded` observations
+rather than ignored, but they do not quarantine a node on their own. On first
+startup it records a baseline without replaying historical anomalies. Cursor
+pagination and a persistent bounded ID set prevent duplicate processing across
+polls and restarts.
 
 Generic IP/Cloudflare probes are intentionally not recovery gates: some
 residential exits can reach Grok normally while a probe endpoint is blocked.
@@ -223,7 +243,8 @@ API remains available.
 
 - HTTPS/SSE audits cannot provide reliable proxy transfer-byte counts. The UI reports active-probe output Tokens and does not label them as network traffic.
 - Intermediary buffering can produce unusually high instantaneous Token/s, so thresholds require calibration for each route.
-- Passive monitoring processes only complete successful streaming requests with enough output to calculate speed. Short and failed requests are ignored.
+- Passive monitoring processes only complete successful streaming requests with enough output to calculate speed. Short and failed requests are skipped; degradation-labelled audits and rows without a first token are counted as `degraded` observations (see above) but do not quarantine by themselves.
+- Token/s is only judged when the generation window reaches `qualityGuard.minimumGenerationWindow`. Such a buffered dump still runs the output-token and thinking checks; only the TPS verdict abstains, so a real buffered burst on a genuinely degraded route is caught by the gateway's degradation attribution or by the active probe instead.
 - A real request may legitimately return cached content, an existing file, or a long constant. Passive soft and hard anomalies therefore isolate immediately and hold the node until a controlled recovery probe succeeds; raise the thresholds when false positives are more costly.
 - Missing-thinking detection applies only to controlled probe profiles that explicitly require thinking. Arbitrary user traffic may legitimately use a non-reasoning model or disable reasoning and is never isolated solely because `reasoningTokens` is zero.
 - The first run establishes an audit baseline. Cumulative statistics also begin when this version first writes state.

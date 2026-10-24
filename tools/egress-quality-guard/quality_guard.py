@@ -52,6 +52,20 @@ LEASE_SCAN_MAX_PAGES = 1000
 LEASE_RECOVERY_MAX_PER_CYCLE = 8
 LEASE_RECOVERY_BACKOFF_BASE_SECONDS = 30
 LEASE_RECOVERY_BACKOFF_MAX_SECONDS = 1800
+# Fallback when an older main service omits qualityGuard.minimumGenerationWindow
+# from the bootstrap. The gateway default is one second.
+DEFAULT_MIN_GENERATION_WINDOW_MS = 1000
+# Audit error codes that record a degradation the gateway itself observed. The
+# withheld/degraded audit rows carry one of these instead of a usable response,
+# so dropping every row with an errorCode hid degrade bursts from the guard.
+DEGRADED_AUDIT_ERROR_CODES = (
+    "quality_degraded",
+    # Withhold confirmed but every candidate account was cooling down.
+    "quality_degraded_no_account",
+    # Upstream EOF/truncation without a terminal stream event.
+    "upstream_stream_incomplete",
+)
+DEGRADED_AUDIT_CLASSIFICATION = "degraded"
 
 
 class GuardDisabled(RuntimeError):
@@ -413,6 +427,32 @@ class ApiClient:
         return payload
 
 
+def minimum_generation_window_ms(config: Config) -> int:
+    """Return the generation window below which TPS is not quality evidence.
+
+    A few milliseconds of "generation" turns ordinary buffered output into
+    96,000-167,000 Token/s. That is a measurement artifact of the buffer flush,
+    not a property of the egress node, so the TPS levels must abstain below this
+    window. The value reuses `qualityGuard.minimumGenerationWindow`, which the
+    gateway also applies to its own degrade decisions.
+    """
+    configured = int(config.min_generation_ms or 0)
+    if configured > 0:
+        return configured
+    return DEFAULT_MIN_GENERATION_WINDOW_MS
+
+
+def degraded_audit_reason(error_code: Any) -> str:
+    """Return the canonical degradation reason for an audit errorCode, or ""."""
+    code = str(error_code or "").strip().lower()
+    if not code:
+        return ""
+    for marker in DEGRADED_AUDIT_ERROR_CODES:
+        if code == marker or code.startswith(marker + "_"):
+            return marker
+    return ""
+
+
 def classify_result(result: dict[str, Any], config: Config, profile: dict[str, Any] | None = None) -> tuple[str, str]:
     expected = ""
     if profile:
@@ -446,10 +486,16 @@ def classify_result(result: dict[str, Any], config: Config, profile: dict[str, A
         require_thinking = bool(profile and profile.get("require_thinking"))
     if require_thinking and output_tokens >= THINKING_GUARD_MIN_OUTPUT_TOKENS and reasoning_tokens <= 0:
         return "hard", "missing_thinking"
-    if config.fail_closed and generation_ms < config.min_generation_ms and speed >= config.soft_tps:
+    min_generation_ms = minimum_generation_window_ms(config)
+    if config.fail_closed and generation_ms < min_generation_ms and speed >= config.soft_tps:
         return "hard", "buffered_burst"
-    if config.fail_closed and generation_ms < config.min_generation_ms:
+    if config.fail_closed and generation_ms < min_generation_ms:
         return "soft", "insufficient_generation_window"
+    if 0 < generation_ms < min_generation_ms:
+        # The probe reported a window too short for a physical Token/s value.
+        # Abstain instead of quarantining on a buffer-flush artifact; marker and
+        # thinking checks above remain authoritative.
+        return "healthy", "generation_window_below_minimum"
     if speed >= config.hard_tps:
         return "hard", "hard_tps"
     if speed >= config.soft_tps:
@@ -520,24 +566,42 @@ def resolve_probe_profile(path: Path, profile_id: str = "") -> tuple[str, dict[s
 def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, float, int]:
     if value.get("provider") != "grok_build" or not bool(value.get("streaming")):
         return "ignored", "not_build_stream", 0.0, 0
+    output_tokens = max(0, int(value.get("outputTokens") or 0))
+    error_code = str(value.get("errorCode") or "").strip()
+    if error_code:
+        # A withheld degraded response never reaches the client, so its audit
+        # row carries an errorCode (and no first token) instead of a body.
+        # Treating that as an ordinary failure is exactly why the guard used to
+        # be structurally blind to degrade bursts.
+        reason = degraded_audit_reason(error_code)
+        if reason:
+            return DEGRADED_AUDIT_CLASSIFICATION, reason, 0.0, output_tokens
+        return "ignored", "unsuccessful", 0.0, 0
     status = int(value.get("statusCode") or 0)
-    if status < 200 or status >= 300 or value.get("errorCode"):
+    if status < 200 or status >= 300:
         return "ignored", "unsuccessful", 0.0, 0
     first_token_ms = value.get("firstTokenMs")
     if first_token_ms is None:
-        return "ignored", "missing_first_token", 0.0, 0
+        # No first token means the stream was held until it completed or was
+        # withheld entirely. That is degrade evidence, not an unusable sample.
+        return DEGRADED_AUDIT_CLASSIFICATION, "missing_first_token", 0.0, output_tokens
     reasoning_tokens = max(0, int(value.get("reasoningTokens") or 0))
     generation_ms = generation_window_ms(
         int(first_token_ms),
         int(value.get("durationMs") or 0),
         reasoning_tokens,
     )
-    output_tokens = max(0, int(value.get("outputTokens") or 0))
     if generation_ms <= 0 or output_tokens < 32:
         return "ignored", "insufficient_output_tokens", 0.0, output_tokens
     speed = float(output_tokens) * 1000 / float(generation_ms)
-    if config.fail_closed and generation_ms < config.min_generation_ms and speed >= config.soft_tps:
+    min_generation_ms = minimum_generation_window_ms(config)
+    if config.fail_closed and generation_ms < min_generation_ms and speed >= config.soft_tps:
         return "hard", "buffered_burst", speed, output_tokens
+    if generation_ms < min_generation_ms:
+        # first_token_ms == duration_ms leaves a 1-9 ms "window" and reports
+        # 10^5 Token/s. That is the buffer flush, not the egress node: abstain
+        # from the TPS levels instead of quarantining a healthy node.
+        return "ignored", "generation_window_below_minimum", speed, output_tokens
     if speed >= config.hard_tps:
         return "hard", "hard_tps", speed, output_tokens
     if speed >= config.soft_tps:
@@ -565,6 +629,7 @@ def default_node_state() -> dict[str, Any]:
         "quarantined_lease_count": 0,
         "active_soft_strikes": 0,
         "passive_soft_strikes": 0,
+        "passive_degraded_strikes": 0,
         "error_strikes": 0,
         "quarantined_until": 0.0,
         "disabled_by_guard": False,
@@ -589,8 +654,8 @@ def default_node_state() -> dict[str, Any]:
 def default_statistics() -> dict[str, Any]:
     return {
         "started_at": time.time(),
-        "active": {"total": 0, "healthy": 0, "soft": 0, "hard": 0, "errors": 0, "output_tokens": 0},
-        "passive": {"total": 0, "healthy": 0, "soft": 0, "hard": 0, "errors": 0, "output_tokens": 0},
+        "active": {"total": 0, "healthy": 0, "soft": 0, "hard": 0, "degraded": 0, "errors": 0, "output_tokens": 0},
+        "passive": {"total": 0, "healthy": 0, "soft": 0, "hard": 0, "degraded": 0, "errors": 0, "output_tokens": 0},
         "actions": {"quarantined": 0, "restored": 0, "suppressed": 0},
     }
 
@@ -1005,6 +1070,7 @@ class Guard:
         state.update({
             "active_soft_strikes": 0,
             "passive_soft_strikes": 0,
+            "passive_degraded_strikes": 0,
             "error_strikes": 0,
             "quarantined_until": now + self.config.quarantine_seconds * scale,
             "disabled_by_guard": True,
@@ -1090,6 +1156,7 @@ class Guard:
         if classification == "healthy":
             state["active_soft_strikes"] = 0
             state["passive_soft_strikes"] = 0
+            state["passive_degraded_strikes"] = 0
         elif classification == "soft":
             state["active_soft_strikes"] = int(state.get("active_soft_strikes", 0)) + 1
         else:
@@ -1476,7 +1543,40 @@ class Guard:
         })
         if classification == "healthy":
             state["passive_soft_strikes"] = 0
+            state["passive_degraded_strikes"] = 0
             state["passive_degrade_repeats"] = 0
+            return
+        if classification == DEGRADED_AUDIT_CLASSIFICATION:
+            # Confirmed degradation evidence (withheld/degraded response or a
+            # stream that never recorded a first token). Count it so the guard
+            # is no longer blind, but do not disable a shared node from a single
+            # request-level observation: these bursts are time-global and a
+            # one-row quarantine cascades across every node. Node disposition
+            # stays with the rate-based attribution layer.
+            state["passive_degraded_strikes"] = int(state.get("passive_degraded_strikes", 0)) + 1
+            append_state_event(
+                self.state,
+                "passive_degraded_observed",
+                node_id=node_id,
+                node_name=node.get("name"),
+                reason=reason,
+                classification=classification,
+                output_tokens=output_tokens,
+                request_id=str(audit_value.get("requestId") or ""),
+            )
+            log_event(
+                "passive_degraded_observed",
+                request_id=audit_value.get("requestId"),
+                node_id=node_id,
+                node_name=node.get("name"),
+                account_id=str(audit_value.get("accountId") or ""),
+                classification=classification,
+                reason=reason,
+                output_tokens=output_tokens,
+                error_code=str(audit_value.get("errorCode") or ""),
+                duration_ms=int(audit_value.get("durationMs") or 0),
+                strikes=int(state.get("passive_degraded_strikes", 0)),
+            )
             return
         if classification == "soft":
             state["passive_soft_strikes"] = int(state.get("passive_soft_strikes", 0)) + 1
