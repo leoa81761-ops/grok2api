@@ -381,8 +381,26 @@ func parseVideoStream(response *http.Response, progress func(int)) (provider.Vid
 				}
 				sort.Strings(keys)
 				log.Printf("[VIDEO-DEBUG] response keys=%v", keys)
+				if user, ok := resp["userResponse"].(map[string]any); ok {
+					raw, _ := json.Marshal(user)
+					if len(raw) > 500 {
+						raw = raw[:500]
+					}
+					log.Printf("[VIDEO-DEBUG] userResponse=%s", string(raw))
+				}
+				if action, ok := resp["queryAction"]; ok {
+					raw, _ := json.Marshal(action)
+					if len(raw) > 300 {
+						raw = raw[:300]
+					}
+					log.Printf("[VIDEO-DEBUG] queryAction=%s", string(raw))
+				}
 				if stream, ok := resp["streamingVideoGenerationResponse"].(map[string]any); ok {
-					log.Printf("[VIDEO-DEBUG] stream progress=%v videoPostId=%v videoUrl=%v", stream["progress"], stream["videoPostId"], stream["videoUrl"])
+					raw, _ := json.Marshal(stream)
+					if len(raw) > 400 {
+						raw = raw[:400]
+					}
+					log.Printf("[VIDEO-DEBUG] stream=%s", string(raw))
 				}
 				if modelResp, ok := resp["modelResponse"].(map[string]any); ok {
 					log.Printf("[VIDEO-DEBUG] modelResponse keys=%v", func() []string {
