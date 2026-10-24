@@ -325,13 +325,14 @@ type QualityGuardRequestRetryConfig struct {
 	DegradeNodeThreshold float64 `yaml:"degradeNodeThreshold"`
 	// DegradeNodeMinAccounts 是判定 NODE 前该节点上最少的不同账号数。
 	DegradeNodeMinAccounts int `yaml:"degradeNodeMinAccounts"`
-	// DegradeMaxAttributionInputTokens 是计入归因统计的输入 token 上限；
-	// 达到它的命中只打 context_large 观测标签，不参与账号/节点统计（线上 1 天
-	// 数据里 input≈130k 的请求 92% 无推理是相关而非因果，成因待定位）。
+	// DegradeMaxAttributionInputTokens 是「空转窄规则形状命中」的统计输入上限：
+	// 只有 agent_empty_tool_turn 来源达到它时打 context_large 观测标签并跳过统计。
+	// 标签命中（quality_withhold / upstream_stream_incomplete）一律计入统计，
+	// 不受输入大小限制（大上下文流量由全局抑制线兜底）。
 	// 注意：大上下文不会改变请求的重试/失败路径，不存在上下文硬上限。
 	DegradeMaxAttributionInputTokens int `yaml:"degradeMaxAttributionInputTokens"`
 	// DegradeShapeMinGenerationMS 以下的生成窗口（duration - firstToken）视为
-	// 缓冲倾倒/测量伪影（SHAPE），跳过归因统计、不惩罚任何对象。
+	// 缓冲倾倒/测量伪影（SHAPE），只对空转窄规则形状命中生效。
 	DegradeShapeMinGenerationMS int `yaml:"degradeShapeMinGenerationMS"`
 	// DegradeAccountCooldownLadder 是账号冷却阶梯，按连续命中次数依次取用，
 	// 用尽后重复最后一档。默认 5m → 15m → 1h。

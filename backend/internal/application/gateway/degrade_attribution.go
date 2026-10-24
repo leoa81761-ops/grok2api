@@ -133,13 +133,29 @@ func normalizeDegradeCooldown(value, fallback time.Duration) time.Duration {
 	return value
 }
 
-// degradationSource 是退化事件来源：质量守卫 Withhold 或上游流式截断。
+// degradationSource 是退化事件来源：
+//   - quality_withhold：质量守卫判定缺思考（标签命中，含 burst/cipher/missing-thinking）；
+//   - upstream_stream_incomplete：上游流式截断（标签命中）；
+//   - agent_empty_tool_turn：agent 空转窄规则（形状命中，需要按测量值分层）。
 type degradationSource string
 
 const (
 	degradationSourceQualityWithhold    degradationSource = "quality_withhold"
-	degradationSourceUpstreamTruncation degradationSource = "upstream_truncation"
+	degradationSourceUpstreamTruncation degradationSource = "upstream_stream_incomplete"
+	degradationSourceAgentEmptyToolTurn degradationSource = "agent_empty_tool_turn"
 )
+
+// degradationSourceIsLabelHit 判断来源是否属于「网关自身结论」的标签命中：
+// 这类命中一律计入账号/节点统计，不受 input_tokens / gen_window 分层限制。
+// hold 掉的流没有首字时间，gen_window=0 是「不可测」而不是测量伪影。
+func degradationSourceIsLabelHit(source degradationSource) bool {
+	switch source {
+	case degradationSourceQualityWithhold, degradationSourceUpstreamTruncation:
+		return true
+	default:
+		return false
+	}
+}
 
 // degradationMode 控制灰度开关：
 //   - observe（默认）：照常计算归因、命中统计与结构化日志，但不执行任何处置
@@ -183,10 +199,12 @@ const (
 
 // degradationHit 是请求路径上归类后的一次退化命中。
 type degradationHit struct {
-	source      degradationSource
-	accountID   uint64
-	nodeID      uint64
-	inputTokens int64
+	source degradationSource
+	// withholdRule 是质量守卫的触发规则（仅 Withhold 来源有值），用于日志排查。
+	withholdRule qualityWithholdRule
+	accountID    uint64
+	nodeID       uint64
+	inputTokens  int64
 	// genWindowMS = duration_ms - first_token_ms；-1 表示无法测量。
 	genWindowMS int64
 	at          time.Time
@@ -207,8 +225,14 @@ func newWithholdDegradationHit(credential accountdomain.Credential, trace *infra
 	if evidence.HasVisible && evidence.VisibleFlushMS >= 0 {
 		genWindow = evidence.VisibleFlushMS
 	}
+	// 只有 agent 空转窄规则是「形状命中」，需要按 gen_window/input 分层；
+	// 其余 Withhold（burst/cipher/missing-thinking）都是标签命中，一律入统计。
+	source := degradationSourceQualityWithhold
+	if evidence.WithholdRule == qualityWithholdRuleEmptyToolTurn {
+		source = degradationSourceAgentEmptyToolTurn
+	}
 	return degradationHit{
-		source: degradationSourceQualityWithhold, accountID: credential.ID,
+		source: source, withholdRule: evidence.WithholdRule, accountID: credential.ID,
 		nodeID: degradationEgressNodeID(trace, provider), inputTokens: usage.InputTokens,
 		genWindowMS: genWindow, at: time.Now().UTC(),
 	}
@@ -234,11 +258,17 @@ func (cfg QualityRetryRuntime) degradeShapeMinGenerationMS() int64 {
 	return normalizeDegradeGenWindowMS(cfg.DegradeShapeMinGenerationMS)
 }
 
-// classifyDegradationHit 按命中分层决定是否进入归因统计：
-// 输入达到统计上限 → CONTEXT 观测标签（不入统计，也不做任何处置）；
-// 生成窗口过短 → SHAPE 测量伪影（不入统计）；否则进入归因。
-// 大上下文不会改变请求的失败/重试路径：换号重试照常进行。
+// classifyDegradationHit 按来源分层决定是否进入归因统计：
+//   - 标签命中（quality_withhold / upstream_stream_incomplete）一律 eligible：
+//     标签是网关自身「缺思考/截断」的结论，不是 TPS 测量；hold 掉的流没有首字
+//     时间，gen_window=0 是「不可测」而不是「测量伪影」。大上下文标签命中同样
+//     计入统计，由全局抑制线兜底，而不是靠丢样本。
+//   - 只有空转窄规则（agent_empty_tool_turn）是形状命中，才应用
+//     input>=统计上限 → CONTEXT、gen_window<500ms → SHAPE 的跳过规则。
 func (cfg QualityRetryRuntime) classifyDegradationHit(hit degradationHit) degradationHitClass {
+	if degradationSourceIsLabelHit(hit.source) {
+		return degradationHitEligible
+	}
 	if hit.inputTokens >= cfg.degradeMaxAttributionInputTokens() {
 		return degradationHitContext
 	}
@@ -759,11 +789,16 @@ func qualityRequestDeclaresTools(body []byte) bool {
 func (s *Service) observeDegradationHit(ctx context.Context, requestID string, credential accountdomain.Credential, hit degradationHit, usage Usage, cfg QualityRetryRuntime) degradationReason {
 	class := cfg.classifyDegradationHit(hit)
 	if class == degradationHitContext || class == degradationHitShape {
-		// 这两类命中不惩罚任何对象：CONTEXT 只是「输入很大」的观测标签
+		// 这两类命中不惩罚任何对象：CONTEXT 是「输入很大」的观测标签
 		// （线上 130k 输入 92% 无推理是相关而非因果，待后续定位），
-		// SHAPE 是缓冲倾倒/测量伪影。
+		// SHAPE 是缓冲倾倒/测量伪影。只有空转窄规则（形状命中）会走到这里；
+		// withhold/截断等标签命中一律进入统计，不会被告警为 skipped。
 		s.logger.Info("degradation_skipped",
-			"request_id", requestID, "source", string(hit.source), "reason", string(degradationReasonForHitClass(class)),
+			"request_id", requestID, "source", string(hit.source),
+			"withhold_rule", string(hit.withholdRule),
+			"reason", string(degradationReasonForHitClass(class)),
+			"skip_dimension", string(degradationReasonForHitClass(class)),
+			"label_hit", degradationSourceIsLabelHit(hit.source),
 			"mode", cfg.degradationMode(),
 			"context_large", hit.inputTokens >= cfg.degradeMaxAttributionInputTokens(),
 			"account_id", credential.ID, "egress_node_id", hit.nodeID,
@@ -786,6 +821,8 @@ func (s *Service) observeDegradationHit(ctx context.Context, requestID string, c
 	s.logger.Info("degradation_attributed",
 		"request_id", requestID,
 		"source", string(hit.source),
+		"withhold_rule", string(hit.withholdRule),
+		"label_hit", degradationSourceIsLabelHit(hit.source),
 		"mode", cfg.degradationMode(),
 		"reason", string(evidence.decision),
 		"action", action,
@@ -1000,13 +1037,14 @@ func (s *Selector) markDegradedAccount(ctx context.Context, credential accountdo
 
 // observeHealthyQualitySample 记录一次正常交付样本，并在观察到真实推理证据时
 // 清空账号冷却阶梯（「账号一次正常有推理成功则清零阶梯」）。正常样本参与比例
-// 分母，因此窗口内的退化率需要正负样本共同支撑；大上下文样本不入统计。
+// 分母，因此窗口内的退化率需要正负样本共同支撑。
+//
+// 注意：正常样本不做 input_tokens 过滤——标签命中（含大上下文）一律进入统计，
+// 分母也必须包含同样口径的正常样本，否则大上下文流量会系统性地推高退化率。
 func (s *Service) observeHealthyQualitySample(credential accountdomain.Credential, trace *infraegress.Trace, provider accountdomain.Provider, usage Usage, evidence QualityStreamEvidence) {
+	_ = usage
 	cfg := s.qualityRetryConfig()
 	if !cfg.DegradeAttributionEnabled {
-		return
-	}
-	if usage.InputTokens >= cfg.degradeMaxAttributionInputTokens() {
 		return
 	}
 	hit := degradationHit{accountID: credential.ID, nodeID: degradationEgressNodeID(trace, provider), at: time.Now().UTC()}

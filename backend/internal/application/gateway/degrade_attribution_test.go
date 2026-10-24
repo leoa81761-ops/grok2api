@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -139,17 +140,74 @@ func TestClassifyDegradationHitLayers(t *testing.T) {
 		hit  degradationHit
 		want degradationHitClass
 	}{
-		{name: "large context is observation-only", hit: degradationHit{inputTokens: 130936, genWindowMS: 5000}, want: degradationHitContext},
-		{name: "context skipped at attribution cap", hit: degradationHit{inputTokens: 60000, genWindowMS: 5000}, want: degradationHitContext},
-		{name: "shape artifact below generation floor", hit: degradationHit{inputTokens: 1000, genWindowMS: 120}, want: degradationHitShape},
-		{name: "eligible normal hit", hit: degradationHit{inputTokens: 1000, genWindowMS: 900}, want: degradationHitEligible},
-		{name: "unknown generation window is eligible", hit: degradationHit{inputTokens: 1000, genWindowMS: -1}, want: degradationHitEligible},
+		// 标签命中（withhold / 上游截断）是网关自身结论，一律计入统计：
+		// hold 掉的流没有首字时间，gen_window=0 是「不可测」而不是伪影。
+		{name: "withheld stream without first token is eligible", hit: degradationHit{source: degradationSourceQualityWithhold, genWindowMS: 0}, want: degradationHitEligible},
+		{name: "withheld stream without measurable window is eligible", hit: degradationHit{source: degradationSourceQualityWithhold, genWindowMS: -1}, want: degradationHitEligible},
+		{name: "withheld large context still eligible", hit: degradationHit{source: degradationSourceQualityWithhold, inputTokens: 130936, genWindowMS: 0}, want: degradationHitEligible},
+		{name: "truncated large context still eligible", hit: degradationHit{source: degradationSourceUpstreamTruncation, inputTokens: 130000, genWindowMS: 0}, want: degradationHitEligible},
+		// 只有空转窄规则形状命中才按测量值分层。
+		{name: "empty tool turn short window is shape", hit: degradationHit{source: degradationSourceAgentEmptyToolTurn, inputTokens: 1000, genWindowMS: 200}, want: degradationHitShape},
+		{name: "empty tool turn large context is context", hit: degradationHit{source: degradationSourceAgentEmptyToolTurn, inputTokens: 60000, genWindowMS: 5000}, want: degradationHitContext},
+		{name: "empty tool turn normal window eligible", hit: degradationHit{source: degradationSourceAgentEmptyToolTurn, inputTokens: 1000, genWindowMS: 900}, want: degradationHitEligible},
+		{name: "empty tool turn unknown window eligible", hit: degradationHit{source: degradationSourceAgentEmptyToolTurn, inputTokens: 1000, genWindowMS: -1}, want: degradationHitEligible},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := cfg.classifyDegradationHit(test.hit); got != test.want {
 				t.Fatalf("classifyDegradationHit(%#v) = %v, want %v", test.hit, got, test.want)
 			}
 		})
+	}
+}
+
+func TestWithholdSourceSelectionFromRule(t *testing.T) {
+	t.Parallel()
+	credential := accountdomain.Credential{ID: 1, Provider: accountdomain.ProviderBuild}
+	cases := []struct {
+		rule qualityWithholdRule
+		want degradationSource
+	}{
+		{rule: qualityWithholdRuleEmptyToolTurn, want: degradationSourceAgentEmptyToolTurn},
+		{rule: qualityWithholdRuleMissingThinking, want: degradationSourceQualityWithhold},
+		{rule: qualityWithholdRuleBurstDump, want: degradationSourceQualityWithhold},
+		{rule: qualityWithholdRuleNone, want: degradationSourceQualityWithhold},
+	}
+	for _, test := range cases {
+		hit := newWithholdDegradationHit(credential, nil, accountdomain.ProviderBuild, Usage{}, QualityStreamEvidence{WithholdRule: test.rule})
+		if hit.source != test.want {
+			t.Fatalf("rule %q -> source %q, want %q", test.rule, hit.source, test.want)
+		}
+	}
+}
+
+// peek 要把 Withhold 的触发规则回传给归因层，否则无法区分标签命中与空转窄规则。
+func TestPeekReportsWithholdRule(t *testing.T) {
+	t.Parallel()
+	cfg := QualityRetryRuntime{MinOutputTokens: 8, HoldTimeout: time.Second, DegradeEmptyToolTurn: true}
+	// 空转窄规则：tools 声明 + 3 token 纯文本 + 无工具调用 + 无推理。
+	tiny := sse(`data: {"choices":[{"delta":{"content":"hi."}}]}`,
+		`data: {"usage":{"prompt_tokens":10,"completion_tokens":2,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+		"data: [DONE]")
+	options := &QualityPeekOptions{ToolsDeclared: true}
+	_, verdict, _, _, err := peekQualityStream(context.Background(), io.NopCloser(strings.NewReader(tiny)), qualityProtocolChat, cfg, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verdict != QualityWithhold || options.Evidence.WithholdRule != qualityWithholdRuleEmptyToolTurn {
+		t.Fatalf("tiny tool turn: verdict=%s rule=%q", verdict, options.Evidence.WithholdRule)
+	}
+
+	// missing-thinking：没有 tools 的长文本无推理，应回传 missing_thinking 规则。
+	long := sse(`data: {"choices":[{"delta":{"content":"`+strings.Repeat("abcd", 40)+`"}}]}`,
+		`data: {"usage":{"prompt_tokens":10,"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+		"data: [DONE]")
+	options = &QualityPeekOptions{}
+	_, verdict, _, _, err = peekQualityStream(context.Background(), io.NopCloser(strings.NewReader(long)), qualityProtocolChat, cfg, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verdict != QualityWithhold || options.Evidence.WithholdRule != qualityWithholdRuleMissingThinking {
+		t.Fatalf("missing thinking: verdict=%s rule=%q", verdict, options.Evidence.WithholdRule)
 	}
 }
 
@@ -583,21 +641,37 @@ func TestObserveDegradationHitSkipsContextAndShape(t *testing.T) {
 	credential := accountdomain.Credential{ID: 71, Provider: accountdomain.ProviderBuild}
 	cfg := service.qualityRetryConfig()
 
-	if reason := service.observeDegradationHit(ctx, "req-shape", credential, degradationHit{accountID: credential.ID, nodeID: 7, inputTokens: 1000, genWindowMS: 100}, Usage{}, cfg); reason != degradationReasonShape {
+	// 空转窄规则（形状命中）才被 SHAPE/CONTEXT 过滤。
+	shape := degradationHit{source: degradationSourceAgentEmptyToolTurn, accountID: credential.ID, nodeID: 7, inputTokens: 1000, genWindowMS: 100}
+	if reason := service.observeDegradationHit(ctx, "req-shape", credential, shape, Usage{}, cfg); reason != degradationReasonShape {
 		t.Fatalf("shape hit = %q", reason)
 	}
 	if service.degrade.accountStrikes(credential.ID) != 0 || len(service.degrade.accounts) != 0 {
 		t.Fatal("shape hit must not enter attribution statistics")
 	}
-	if reason := service.observeDegradationHit(ctx, "req-context", credential, degradationHit{accountID: credential.ID, nodeID: 7, inputTokens: 60000, genWindowMS: 5000}, Usage{}, cfg); reason != degradationReasonContext {
+	contextHit := degradationHit{source: degradationSourceAgentEmptyToolTurn, accountID: credential.ID, nodeID: 7, inputTokens: 60000, genWindowMS: 5000}
+	if reason := service.observeDegradationHit(ctx, "req-context", credential, contextHit, Usage{}, cfg); reason != degradationReasonContext {
 		t.Fatalf("context hit = %q", reason)
 	}
-	// 大上下文只做观测标签：即使 200k 输入也不进入统计、不触发 503 路径。
-	if reason := service.observeDegradationHit(ctx, "req-context-large", credential, degradationHit{accountID: credential.ID, nodeID: 7, inputTokens: 204675, genWindowMS: 5000}, Usage{}, cfg); reason != degradationReasonContext {
+	largeContext := degradationHit{source: degradationSourceAgentEmptyToolTurn, accountID: credential.ID, nodeID: 7, inputTokens: 204675, genWindowMS: 5000}
+	if reason := service.observeDegradationHit(ctx, "req-context-large", credential, largeContext, Usage{}, cfg); reason != degradationReasonContext {
 		t.Fatalf("large context hit = %q", reason)
 	}
 	if len(service.degrade.accounts) != 0 {
 		t.Fatal("context hit must not enter attribution statistics")
+	}
+
+	// 标签命中（withhold）没有首字时间、gen_window=0，也必须计入统计，
+	// 否则灰度期收集不到任何降智主信号。这里用 observe 模式避免触发处置副作用
+	// （本测试只验证分层，不验证处置）。
+	withheldCfg := cfg
+	withheldCfg.DegradationMode = degradationModeObserve
+	withheld := degradationHit{source: degradationSourceQualityWithhold, accountID: credential.ID, nodeID: 7, genWindowMS: 0}
+	if reason := service.observeDegradationHit(ctx, "req-withheld", credential, withheld, Usage{}, withheldCfg); reason == degradationReasonShape || reason == degradationReasonContext {
+		t.Fatalf("withheld label hit must not be skipped, got reason=%q", reason)
+	}
+	if len(service.degrade.accounts) != 1 {
+		t.Fatalf("withheld label hit must enter attribution statistics, accounts=%d", len(service.degrade.accounts))
 	}
 }
 
@@ -681,16 +755,19 @@ func TestDegradeAttributionFailClosedNeverDeliversDegradedTwoHundred(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 测试 SSE 瞬间完成（可见首 token 到 [DONE] < 500ms）→ SHAPE 测量伪影：
-	// 只记录日志，不进入账号/节点统计，也不惩罚账号。
-	if !account.Enabled || account.CooldownUntil != nil || account.LastError != "" {
-		t.Fatalf("shape-skipped degradation must not punish the account: %#v", account)
+	// 守卫 Withhold 是标签命中：即使测试 SSE 瞬间完成（gen_window≈0），
+	// 也必须进入统计。单次样本只能归因到 UNKNOWN → 2m 短冷却，不禁用账号。
+	if !account.Enabled || account.LastError != accountdomain.LastErrorDegradedAccount {
+		t.Fatalf("withheld label hit must apply UNKNOWN short cooldown, not disable: %#v", account)
+	}
+	if account.CooldownUntil == nil || time.Until(*account.CooldownUntil) > 3*time.Minute {
+		t.Fatalf("withheld label hit must apply short cooldown, got %#v", account)
 	}
 }
 
-// 大上下文不是失败原因（实测上游没有 128k 硬上限）：超过归因统计上限的命中
-// 只打 context_large 观测标签，请求照常换号重试，绝不能因为上下文大就 503
-// context_window_exceeded，也绝不能把大上下文账号打进统计。
+// 大上下文不是失败原因（实测上游没有 128k 硬上限）：标签命中（withhold）即使
+// input 很大也照常计入统计、照常换号重试，绝不能 503 context_window_exceeded，
+// 也不能因为上下文大就丢样本（由全局抑制线兜底）。
 func TestLargeContextStillRetriesAndNeverPunishesAccounts(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "degrade-context.db"))
@@ -778,14 +855,20 @@ func TestLargeContextStillRetriesAndNeverPunishesAccounts(t *testing.T) {
 	if attempts := adapter.Attempts(); len(attempts) != 2 {
 		t.Fatalf("large-context degraded request must retry on another account, attempts=%#v", attempts)
 	}
-	// 超过统计上限的命中不进入账号统计：账号不应被冷却或禁用。
+	// 大上下文标签命中现在照常进入归因统计（不再按输入大小丢弃样本），
+	// 但每个账号只有 1 个样本，最多是 UNKNOWN 的短冷却，绝不能被禁用。
 	for _, credential := range credentials {
 		account, err := accountRepo.Get(ctx, credential.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !account.Enabled || account.CooldownUntil != nil || account.LastError != "" {
-			t.Fatalf("large-context hits must not punish accounts: %#v", account)
+		if !account.Enabled {
+			t.Fatalf("large-context hits must never disable accounts: %#v", account)
+		}
+		if account.CooldownUntil != nil {
+			if remaining := time.Until(*account.CooldownUntil); remaining > 3*time.Minute {
+				t.Fatalf("single-sample attribution must only apply short cooldown, got %#v", account)
+			}
 		}
 	}
 }

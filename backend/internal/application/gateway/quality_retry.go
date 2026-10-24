@@ -348,33 +348,64 @@ func qualityIsEmptyToolTurn(sig QualityStreamSignals, minOutput int64) bool {
 	return sig.VisibleTokens < minOutput && sig.OutputTokens < minOutput
 }
 
+// qualityWithholdRule 记录这次 Withhold 由哪条判定规则触发。降智归因用它区分
+// 「标签命中」（缺思考/截断，属于网关自身结论，一律计入统计）与「空转窄规则」
+// （形状命中，才需要按 gen_window/input 分层剔除测量伪影）。
+type qualityWithholdRule string
+
+const (
+	qualityWithholdRuleNone            qualityWithholdRule = ""
+	qualityWithholdRuleBurstDump       qualityWithholdRule = "burst_dump"
+	qualityWithholdRuleCipherDrool     qualityWithholdRule = "cipher_drool"
+	qualityWithholdRuleFakeEncrypted   qualityWithholdRule = "fake_encrypted_dump"
+	qualityWithholdRuleFastReasoning   qualityWithholdRule = "fast_reasoning_ratio"
+	qualityWithholdRuleMissingThinking qualityWithholdRule = "missing_thinking"
+	qualityWithholdRuleEmptyToolTurn   qualityWithholdRule = "empty_tool_turn"
+)
+
 // ClassifyQualityHold decides whether a held stream may be forwarded.
 // Dump detectors run first so plaintext thinking cannot veto a 1ms
 // reasoning-ratio dump, and vis<minOutput cannot skip fake-enc/burst.
 // Remaining plaintext deltas still deliver. Cipher-only HasThinking waits
 // until visible text has streamed for 2s or the stream ends.
 func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdict {
+	verdict, _ := classifyQualityHold(sig, minOutput)
+	return verdict
+}
+
+// classifyQualityHold 是 ClassifyQualityHold 的带触发规则版本，供降智归因区分
+// 标签命中与空转窄规则形状命中。
+func classifyQualityHold(sig QualityStreamSignals, minOutput int64) (QualityVerdict, qualityWithholdRule) {
 	if minOutput <= 0 {
 		minOutput = defaultQualityMinOutput
 	}
-	if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) || qualityIsFastReasoningRatioDump(sig) || qualityIsEmptyToolTurn(sig, minOutput) {
-		return QualityWithhold
+	switch {
+	case qualityIsBurstDump(sig, minOutput):
+		return QualityWithhold, qualityWithholdRuleBurstDump
+	case qualityIsCipherDrool(sig, minOutput):
+		return QualityWithhold, qualityWithholdRuleCipherDrool
+	case qualityIsFakeEncryptedDump(sig, minOutput):
+		return QualityWithhold, qualityWithholdRuleFakeEncrypted
+	case qualityIsFastReasoningRatioDump(sig):
+		return QualityWithhold, qualityWithholdRuleFastReasoning
+	case qualityIsEmptyToolTurn(sig, minOutput):
+		return QualityWithhold, qualityWithholdRuleEmptyToolTurn
 	}
 	if sig.HasThinking {
 		if sig.HasReasoningDelta {
-			return QualityDeliver
+			return QualityDeliver, qualityWithholdRuleNone
 		}
 		// Cipher-only: do not release when encrypted_content first meets
 		// the floor. Fake dumps send the blob, then the whole answer in
 		// <2s; releasing early lets that dump bypass fake-enc. Wait until
 		// visible text has streamed for 2s, or the stream ends.
 		if sig.Terminal {
-			return QualityDeliver
+			return QualityDeliver, qualityWithholdRuleNone
 		}
 		if sig.VisibleTokens >= minOutput && sig.FirstVisible && sig.VisibleFlushMS >= defaultFakeEncFlushMS {
-			return QualityDeliver
+			return QualityDeliver, qualityWithholdRuleNone
 		}
-		return QualityWait
+		return QualityWait, qualityWithholdRuleNone
 	}
 	// Prefer observed/derived visible output. Total output includes reasoning
 	// tokens, which are deliberately not trusted as quality evidence above. If
@@ -390,35 +421,35 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	// 已在上面处理）。否则几乎每个正常纯文本收尾都会被扣留并重试成 503。
 	if sig.ToolsDeclared && sig.DegradeEmptyToolTurn {
 		if enough || sig.Terminal {
-			return QualityDeliver
+			return QualityDeliver, qualityWithholdRuleNone
 		}
-		return QualityWait
+		return QualityWait, qualityWithholdRuleNone
 	}
 	if sig.ReasoningStarted && !sig.Terminal && !sig.HoldExpired {
-		return QualityWait
+		return QualityWait, qualityWithholdRuleNone
 	}
 	if sig.Terminal {
 		if output <= 0 {
-			return QualityWait
+			return QualityWait, qualityWithholdRuleNone
 		}
 		if enough {
-			return QualityWithhold
+			return QualityWithhold, qualityWithholdRuleMissingThinking
 		}
-		return QualityDeliver
+		return QualityDeliver, qualityWithholdRuleNone
 	}
 	if enough {
-		return QualityWithhold
+		return QualityWithhold, qualityWithholdRuleMissingThinking
 	}
 	if sig.HoldExpired {
 		if output <= 0 {
-			return QualityWait
+			return QualityWait, qualityWithholdRuleNone
 		}
 		if enough {
-			return QualityWithhold
+			return QualityWithhold, qualityWithholdRuleMissingThinking
 		}
-		return QualityDeliver
+		return QualityDeliver, qualityWithholdRuleNone
 	}
-	return QualityWait
+	return QualityWait, qualityWithholdRuleNone
 }
 
 // qualityPeekAbortError prefers the idle-timeout cause over a plain

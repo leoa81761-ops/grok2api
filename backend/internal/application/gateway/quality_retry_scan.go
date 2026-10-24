@@ -42,7 +42,10 @@ type qualityScanState struct {
 	responseID                      string
 	terminal                        bool
 	holdExpired                     bool
-	firstVisibleAt                  time.Time
+	// withholdRule 记录本次 Withhold 的触发规则；降智归因据此区分
+	// 「标签命中」与「空转窄规则形状命中」。
+	withholdRule   qualityWithholdRule
+	firstVisibleAt time.Time
 }
 
 type qualityReadResult struct {
@@ -513,6 +516,8 @@ type QualityStreamEvidence struct {
 	// 用于把缓冲倾倒/测量伪影（SHAPE）从账号/节点统计里剔除。
 	HasVisible     bool
 	VisibleFlushMS int64
+	// WithholdRule 是本次 Withhold 的触发规则；空值表示没有 withhold。
+	WithholdRule qualityWithholdRule
 }
 
 // QualityPeekOptions 是质量守卫流的附加输入与输出。ToolsDeclared 只读：
@@ -527,6 +532,7 @@ func (s *qualityScanState) evidence() QualityStreamEvidence {
 	return QualityStreamEvidence{
 		HasThinking: signals.HasThinking, SemanticOutput: signals.SemanticOutput, Terminal: signals.Terminal,
 		HasVisible: signals.FirstVisible, VisibleFlushMS: signals.VisibleFlushMS,
+		WithholdRule: s.withholdRule,
 	}
 }
 
@@ -555,7 +561,8 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 	defer holdTimer.Stop()
 	for {
 		sig := state.signals()
-		if verdict := ClassifyQualityHold(sig, cfg.MinOutputTokens); verdict != QualityWait {
+		if verdict, rule := classifyQualityHold(sig, cfg.MinOutputTokens); verdict != QualityWait {
+			state.withholdRule = rule
 			return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
 		}
 		// A completed empty stream must rotate immediately. Waiting for idle
@@ -572,7 +579,8 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 		case <-holdTimer.C:
 			state.holdExpired = true
 			sig.HoldExpired = true
-			if verdict := ClassifyQualityHold(sig, cfg.MinOutputTokens); verdict != QualityWait {
+			if verdict, rule := classifyQualityHold(sig, cfg.MinOutputTokens); verdict != QualityWait {
+				state.withholdRule = rule
 				return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
 			}
 		case result, ok := <-pump.results:
@@ -615,7 +623,9 @@ func finishQualityPeek(held *bytes.Buffer, pump *qualityReadPump, state *quality
 		}
 		return newPrefixReplay(held, pump), QualityWait, state.usage, state.responseID, errQualityEmptyStream
 	}
-	return newPrefixReplay(held, pump), ClassifyQualityHold(signals, cfg.MinOutputTokens), state.usage, state.responseID, nil
+	verdict, rule := classifyQualityHold(signals, cfg.MinOutputTokens)
+	state.withholdRule = rule
+	return newPrefixReplay(held, pump), verdict, state.usage, state.responseID, nil
 }
 
 func newPrefixReplay(held *bytes.Buffer, rest io.ReadCloser) io.ReadCloser {

@@ -193,12 +193,15 @@ qualityGuard:
     #   NODE     节点退化率达到阈值且该节点上多数账号(NODE_MIN_ACCOUNTS 起)也退化
     #            → 只关闭节点调度（UpdateManyEnabled(false)），不惩罚账号、不写
     #            节点健康度。
-    #   CONTEXT  input_tokens 达到 degradeMaxAttributionInputTokens 的命中只打
-    #            context_large 观测标签：不计入账号/节点统计、不惩罚任何对象。
-    #            大上下文不会改变请求的重试/失败路径（实测上游无 128k 硬上限，
-    #            input≈130k 的请求 92% 无推理是相关而非因果，成因待定位）。
-    #   SHAPE    生成窗口（duration - firstToken）< degradeShapeMinGenerationMS 的
-    #            命中是缓冲倾倒/测量伪影：跳过统计、不惩罚任何对象。
+    #   CONTEXT  仅对「空转窄规则形状命中」生效：input_tokens 达到
+    #            degradeMaxAttributionInputTokens 时只打 context_large 观测标签、
+    #            不计入账号/节点统计。标签命中（withhold / 上游截断）一律计入统计，
+    #            不受输入大小限制，靠全局抑制线兜底。
+    #            大上下文不会改变请求的重试/失败路径（实测上游无 128k 硬上限）。
+    #   SHAPE    仅对「空转窄规则形状命中」生效：生成窗口
+    #            （duration - firstToken）< degradeShapeMinGenerationMS 视为
+    #            缓冲倾倒/测量伪影，跳过统计、不惩罚任何对象。
+    #            标签命中（hold 掉的流本来就没有首字时间）不会被 SHAPE 过滤。
     #   UNKNOWN  证据不足（样本不够、全局抑制或只有节点证据）→ 只做一次短冷却。
     # 为什么不能只用 reasoning_tokens=0：线上 direct 出口 99%、proxy 节点 63%–99%
     # 的响应本来就没有推理；1 天定标显示用「reason0 & out>=32」当命中会把 12 个
