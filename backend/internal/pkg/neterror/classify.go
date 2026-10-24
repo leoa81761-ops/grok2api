@@ -25,6 +25,13 @@ var ErrUpstreamResponseEmpty = errors.New("upstream response body is empty")
 // guard. It is distinct from a transport cut (upstream_stream_interrupted).
 var ErrUpstreamOutputLoop = errors.New("model output loop detected")
 
+// ErrUpstreamStreamIncomplete is raised when an upstream streaming response
+// reached EOF without ever sending its terminal event. The converted body must
+// not synthesize a normal finish, because clients read finish_reason/[DONE] as
+// proof that the turn completed and would otherwise treat a truncated answer as
+// a finished one.
+var ErrUpstreamStreamIncomplete = errors.New("upstream stream ended before its terminal event")
+
 // ErrBuildStreamIdleTimeout is retained as a compatibility alias for callers
 // introduced before stream-idle protection became provider-neutral.
 var ErrBuildStreamIdleTimeout = ErrUpstreamStreamIdleTimeout
@@ -64,6 +71,12 @@ func IsUpstreamResponseEmpty(err error) bool {
 // delta doom-loop guard rather than a transport interrupt.
 func IsUpstreamOutputLoop(err error) bool {
 	return errors.Is(err, ErrUpstreamOutputLoop)
+}
+
+// IsUpstreamStreamIncomplete reports whether a streaming response ended before
+// its provider terminal event.
+func IsUpstreamStreamIncomplete(err error) bool {
+	return errors.Is(err, ErrUpstreamStreamIncomplete)
 }
 
 // IdleTimeoutError retains whether any response bytes arrived before an idle

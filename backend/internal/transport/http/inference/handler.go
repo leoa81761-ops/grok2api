@@ -1367,6 +1367,8 @@ func classifyCopyError(ctx context.Context, err error) string {
 		return "upstream_response_empty"
 	case errors.Is(err, neterror.ErrUpstreamOutputLoop):
 		return "upstream_output_loop"
+	case errors.Is(err, neterror.ErrUpstreamStreamIncomplete):
+		return "upstream_stream_incomplete"
 	case errors.Is(err, errUpstreamStreamRead):
 		return "upstream_stream_interrupted"
 	default:
@@ -1514,6 +1516,8 @@ func streamAbortTrailer(protocol streamProtocol, cause error, meta responseMetad
 		code, message = "upstream_stream_idle_timeout", "上游流式响应长时间无数据"
 	case errors.Is(cause, neterror.ErrUpstreamOutputLoop):
 		code, message = "upstream_output_loop", "上游输出陷入循环"
+	case errors.Is(cause, neterror.ErrUpstreamStreamIncomplete):
+		code, message = "upstream_stream_incomplete", "上游流式响应未完整结束"
 	case errors.Is(cause, errUpstreamStreamIncomplete):
 		code, message = "upstream_stream_incomplete", "上游流式响应未完整结束"
 	}

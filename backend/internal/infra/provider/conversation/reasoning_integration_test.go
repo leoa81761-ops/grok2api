@@ -1,11 +1,15 @@
 package conversation
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
 func TestChatMultiTurnReasoningRestoration(t *testing.T) {
@@ -261,8 +265,9 @@ func TestStreamWithoutResponsesTerminalDoesNotCommitReasoningReplay(t *testing.T
 	cache := newReasoningCache(10, time.Hour)
 	scope := "client-session/build"
 	// The source ends after item.done without response.completed/incomplete.
-	// Downstream compatibility still emits its normal terminator, but this is
-	// not sufficient evidence that the upstream tool turn completed.
+	// A truncated stream must be reported as incomplete instead of having a
+	// normal terminator fabricated for it, and it is not sufficient evidence
+	// that the upstream tool turn completed.
 	stream := strings.Join([]string{
 		`event: response.output_item.done`,
 		`data: {"type":"response.output_item.done","item":{"id":"rs_truncated","type":"reasoning","encrypted_content":"truncated-proof"}}`,
@@ -276,11 +281,39 @@ func TestStreamWithoutResponsesTerminalDoesNotCommitReasoningReplay(t *testing.T
 		OperationChat,
 		ResponseOptions{}.WithReasoningReplay(cache, scope),
 	)
-	if _, err := io.ReadAll(converted); err != nil {
-		t.Fatalf("stream conversion failed: %v", err)
+	raw, err := io.ReadAll(converted)
+	if !errors.Is(err, neterror.ErrUpstreamStreamIncomplete) {
+		t.Fatalf("truncated stream error = %v, want ErrUpstreamStreamIncomplete", err)
+	}
+	if bytes.Contains(raw, []byte(`"finish_reason":"stop"`)) || bytes.Contains(raw, []byte("data: [DONE]")) {
+		t.Fatalf("truncated stream fabricated a normal terminator:\n%s", raw)
 	}
 	if _, ok := cache.GetScoped(scope, "call_truncated"); ok {
 		t.Fatal("truncated stream polluted reasoning replay cache")
+	}
+}
+
+func TestStreamWithResponsesTerminalStillCompletesNormally(t *testing.T) {
+	for _, operation := range []string{OperationChat, OperationMessages} {
+		stream := strings.Join([]string{
+			`event: response.output_text.delta`,
+			`data: {"type":"response.output_text.delta","delta":"hello"}`,
+			``,
+			`event: response.completed`,
+			`data: {"type":"response.completed","response":{"id":"resp_ok","status":"completed"}}`,
+			``,
+		}, "\n")
+		raw, err := io.ReadAll(ConvertResponseStream(io.NopCloser(strings.NewReader(stream)), operation))
+		if err != nil {
+			t.Fatalf("%s: terminal stream must not fail: %v", operation, err)
+		}
+		terminator := "data: [DONE]"
+		if operation == OperationMessages {
+			terminator = "message_stop"
+		}
+		if !bytes.Contains(raw, []byte(terminator)) {
+			t.Fatalf("%s: terminal stream lost its terminator:\n%s", operation, raw)
+		}
 	}
 }
 
