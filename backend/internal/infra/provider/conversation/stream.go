@@ -44,8 +44,14 @@ func ConvertResponseStreamWithOptions(source io.ReadCloser, operation string, op
 		defer stream.closeSource()
 		converter := newStreamConverter(writer, operation, options)
 		err := consumeSSE(source, converter.handle)
-		if err == nil {
-			err = converter.finish()
+		if err == nil && !converter.finished {
+			// consumeSSE normalizes an upstream EOF to nil. A stream that never
+			// wrote its own terminator — neither a normal completion nor an
+			// upstream error event — was truncated: synthesizing the legacy
+			// finish_reason/[DONE] terminator here would launder that truncation
+			// into a finished turn, and clients treat the terminator as proof
+			// that the answer is complete.
+			err = neterror.ErrUpstreamStreamIncomplete
 		}
 		_ = writer.CloseWithError(err)
 	}()
