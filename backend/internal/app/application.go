@@ -356,6 +356,14 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	clientKeyRepo.SetInvalidationObserver(invalidationService.Notify)
 	gatewayService := gateway.NewService(modelService, auditService, accountService, clientKeyService, providers, selector, responseRepo, cfg.Routing.MaxAttempts)
 	gatewayService.UpdateQualityRetry(qualityRetryRuntime(cfg.QualityGuard))
+	// 降智归因的处置只复用既有存储/服务：账号×节点用 account_egress_lease_blocks
+	// 租约隔离（账号仓储），节点级只用 egress 运营服务的调度开关，节点名称来自
+	// egress 仓储只读查询（仅用于日志）。
+	// 安全红线：绝不写节点 health/probe_status，否则 AutoRemoveUnhealthyNodes
+	// 会删除 health<0.2 的节点并连带清空该节点上 215+ 账号的绑定。
+	gatewayService.SetEgressLeaseQuarantiner(accountRepo)
+	gatewayService.SetEgressNodeDisabler(egressService)
+	gatewayService.SetEgressNodeLookup(egressRepo)
 	gatewayService.UpdateVideoMaxAttempts(cfg.Routing.VideoMaxAttempts)
 	gatewayService.UpdateMarkBuildChatDeniedAsReauth(cfg.Routing.MarkBuildChatDeniedAsReauth)
 	gatewayService.SetLogger(logger)
@@ -500,21 +508,49 @@ func qualityRetryRuntime(value config.QualityGuardConfig) gateway.QualityRetryRu
 		// Auto-disable needs request-path detection even when the YAML retry
 		// switch is off. Derive this at runtime so turning auto-disable off
 		// restores the original policy without persisting a second switch.
-		Enabled:                         retry.Enabled || retry.AutoDisable,
-		MaxAttempts:                     retry.MaxAttempts,
-		HoldTimeout:                     retry.HoldTimeout.Value(),
-		MinOutputTokens:                 int64(retry.MinOutputTokens),
-		OnExhausted:                     retry.OnExhausted,
-		AutoDisable:                     retry.AutoDisable,
-		AccountCooldown:                 retry.AccountCooldown.Value(),
-		IdleAccountCooldown:             retry.IdleAccountCooldown.Value(),
-		MinEncryptedBytes:               retry.MinEncryptedBytes,
-		EncryptedBytesPerReasoningToken: retry.EncryptedBytesPerReasoningToken,
-		SoftTPS:                         value.SoftTPS,
-		HardTPS:                         value.HardTPS,
-		MinGenerationMS:                 value.MinimumGenerationWindow.Value().Milliseconds(),
-		FailClosed:                      value.FailClosed,
+		Enabled:                          retry.Enabled || retry.AutoDisable,
+		MaxAttempts:                      retry.MaxAttempts,
+		HoldTimeout:                      retry.HoldTimeout.Value(),
+		MinOutputTokens:                  int64(retry.MinOutputTokens),
+		OnExhausted:                      retry.OnExhausted,
+		AutoDisable:                      retry.AutoDisable,
+		AccountCooldown:                  retry.AccountCooldown.Value(),
+		IdleAccountCooldown:              retry.IdleAccountCooldown.Value(),
+		MinEncryptedBytes:                retry.MinEncryptedBytes,
+		EncryptedBytesPerReasoningToken:  retry.EncryptedBytesPerReasoningToken,
+		SoftTPS:                          value.SoftTPS,
+		HardTPS:                          value.HardTPS,
+		MinGenerationMS:                  value.MinimumGenerationWindow.Value().Milliseconds(),
+		FailClosed:                       value.FailClosed,
+		DegradeAttributionEnabled:        retry.DegradeAttributionEnabled,
+		DegradationMode:                  retry.DegradationMode,
+		DegradeWindow:                    retry.DegradeWindow.Value(),
+		DegradeMinSamples:                retry.DegradeMinSamples,
+		DegradeAccountThreshold:          retry.DegradeAccountThreshold,
+		DegradeNodeThreshold:             retry.DegradeNodeThreshold,
+		DegradeNodeMinAccounts:           retry.DegradeNodeMinAccounts,
+		DegradeMaxAttributionInputTokens: int64(retry.DegradeMaxAttributionInputTokens),
+		DegradeShapeMinGenerationMS:      int64(retry.DegradeShapeMinGenerationMS),
+		DegradeAccountCooldowns:          degradeCooldownLadder(retry.DegradeAccountCooldownLadder),
+		DegradeMaxStrikes:                retry.DegradeMaxStrikes,
+		DegradeQuarantineDuration:        retry.DegradeQuarantineDuration.Value(),
+		DegradeUnknownCooldown:           retry.DegradeUnknownCooldown.Value(),
+		DegradeGlobalSuppressThreshold:   retry.DegradeGlobalSuppressThreshold,
+		DegradeEmptyToolTurn:             retry.DegradeEmptyToolTurn,
 	}
+}
+
+// degradeCooldownLadder 把 YAML 的时长阶梯转换为运行时阶梯；空切片交给
+// gateway 归一化时填充默认 5m → 15m → 1h。
+func degradeCooldownLadder(values []config.Duration) []time.Duration {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]time.Duration, 0, len(values))
+	for _, value := range values {
+		result = append(result, value.Value())
+	}
+	return result
 }
 
 func auditLedgerConfig(value config.AuditConfig) auditapp.LedgerConfig {

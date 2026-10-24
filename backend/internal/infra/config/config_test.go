@@ -739,3 +739,68 @@ func TestEffectivePublicAPIBaseURLPriority(t *testing.T) {
 		})
 	}
 }
+
+func TestDefaultDegradeAttributionContract(t *testing.T) {
+	t.Parallel()
+	got := defaultConfig().QualityGuard.RequestRetry
+	if !got.DegradeAttributionEnabled || !got.DegradeEmptyToolTurn {
+		t.Fatalf("degrade attribution switches must default to enabled: %#v", got)
+	}
+	// 灰度默认只观察不处置。
+	if got.DegradationMode != "observe" {
+		t.Fatalf("degradationMode default = %q, want observe", got.DegradationMode)
+	}
+	if got.DegradeWindow.Value() != 30*time.Minute || got.DegradeMinSamples != 5 {
+		t.Fatalf("degrade window/samples = %s/%d", got.DegradeWindow.Value(), got.DegradeMinSamples)
+	}
+	if got.DegradeAccountThreshold != 0.6 || got.DegradeNodeThreshold != 0.8 || got.DegradeNodeMinAccounts != 2 {
+		t.Fatalf("degrade thresholds = %v/%v/%d", got.DegradeAccountThreshold, got.DegradeNodeThreshold, got.DegradeNodeMinAccounts)
+	}
+	// 线上定标的分层参数：>=50k 输入只打 context_large 观测标签（不参与处置），
+	// <500ms 生成窗口归 SHAPE。大上下文不存在硬上限，也不会直接 503。
+	if got.DegradeMaxAttributionInputTokens != 50000 || got.DegradeShapeMinGenerationMS != 500 {
+		t.Fatalf("degrade hit layers = %d/%d", got.DegradeMaxAttributionInputTokens, got.DegradeShapeMinGenerationMS)
+	}
+	ladder := got.DegradeAccountCooldownLadder
+	if len(ladder) != 3 || ladder[0].Value() != 5*time.Minute || ladder[1].Value() != 15*time.Minute || ladder[2].Value() != time.Hour {
+		t.Fatalf("degrade cooldown ladder = %#v", ladder)
+	}
+	if got.DegradeMaxStrikes != 3 || got.DegradeQuarantineDuration.Value() != 15*time.Minute || got.DegradeUnknownCooldown.Value() != 2*time.Minute || got.DegradeGlobalSuppressThreshold != 0.9 {
+		t.Fatalf("degrade strikes/cooldowns/suppress = %d/%s/%s/%v", got.DegradeMaxStrikes, got.DegradeQuarantineDuration.Value(), got.DegradeUnknownCooldown.Value(), got.DegradeGlobalSuppressThreshold)
+	}
+	if err := validateQualityGuardRequestRetry(got); err != nil {
+		t.Fatalf("default degrade attribution must validate: %v", err)
+	}
+}
+
+func TestValidateDegradeAttributionRejectsInvalidValues(t *testing.T) {
+	t.Parallel()
+	base := defaultConfig().QualityGuard.RequestRetry
+	for _, test := range []struct {
+		name   string
+		change func(*QualityGuardRequestRetryConfig)
+	}{
+		{name: "window too small", change: func(c *QualityGuardRequestRetryConfig) { c.DegradeWindow = Duration(5 * time.Second) }},
+		{name: "min samples too small", change: func(c *QualityGuardRequestRetryConfig) { c.DegradeMinSamples = 1 }},
+		{name: "account threshold above one", change: func(c *QualityGuardRequestRetryConfig) { c.DegradeAccountThreshold = 1.2 }},
+		{name: "node threshold below account", change: func(c *QualityGuardRequestRetryConfig) { c.DegradeNodeThreshold = 0.5 }},
+		{name: "node min accounts too small", change: func(c *QualityGuardRequestRetryConfig) { c.DegradeNodeMinAccounts = 1 }},
+		{name: "shape generation window negative", change: func(c *QualityGuardRequestRetryConfig) { c.DegradeShapeMinGenerationMS = -1 }},
+		{name: "empty ladder rung", change: func(c *QualityGuardRequestRetryConfig) {
+			c.DegradeAccountCooldownLadder = []Duration{Duration(5 * time.Minute), 0}
+		}},
+		{name: "max strikes out of range", change: func(c *QualityGuardRequestRetryConfig) { c.DegradeMaxStrikes = 11 }},
+		{name: "quarantine too long", change: func(c *QualityGuardRequestRetryConfig) { c.DegradeQuarantineDuration = Duration(48 * time.Hour) }},
+		{name: "unknown cooldown too small", change: func(c *QualityGuardRequestRetryConfig) { c.DegradeUnknownCooldown = Duration(time.Second) }},
+		{name: "suppress threshold above one", change: func(c *QualityGuardRequestRetryConfig) { c.DegradeGlobalSuppressThreshold = 1.5 }},
+		{name: "invalid degradation mode", change: func(c *QualityGuardRequestRetryConfig) { c.DegradationMode = "half_enforce" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := base
+			test.change(&cfg)
+			if err := validateQualityGuardRequestRetry(cfg); err == nil {
+				t.Fatal("invalid degrade attribution config must be rejected")
+			}
+		})
+	}
+}

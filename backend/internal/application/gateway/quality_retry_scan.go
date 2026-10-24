@@ -31,6 +31,8 @@ type qualityScanState struct {
 	visibleRunes                    int
 	aggregateRunes                  int
 	semanticOutput                  bool
+	toolsDeclared                   bool
+	degradeEmptyToolTurn            bool
 	reasoningTokens                 int64
 	outputTokens                    int64
 	encryptedBytes                  int
@@ -159,19 +161,22 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		flushMS = time.Since(s.firstVisibleAt).Milliseconds()
 	}
 	return QualityStreamSignals{
-		HasThinking:       hasThinking,
-		HasReasoningDelta: s.hasThinking,
-		ReasoningStarted:  s.reasoningStarted || hasThinking,
-		VisibleTokens:     visible,
-		ReasoningTokens:   reasoningTokens,
-		OutputTokens:      output,
-		EncryptedBytes:    s.encryptedBytes,
-		EncryptedFloor:    floor,
-		UsageReported:     s.usage.Reported,
-		FirstVisible:      firstVisible,
-		VisibleFlushMS:    flushMS,
-		Terminal:          s.terminal,
-		HoldExpired:       s.holdExpired,
+		HasThinking:          hasThinking,
+		HasReasoningDelta:    s.hasThinking,
+		ReasoningStarted:     s.reasoningStarted || hasThinking,
+		VisibleTokens:        visible,
+		ReasoningTokens:      reasoningTokens,
+		OutputTokens:         output,
+		EncryptedBytes:       s.encryptedBytes,
+		EncryptedFloor:       floor,
+		UsageReported:        s.usage.Reported,
+		FirstVisible:         firstVisible,
+		VisibleFlushMS:       flushMS,
+		Terminal:             s.terminal,
+		HoldExpired:          s.holdExpired,
+		SemanticOutput:       s.semanticOutput,
+		ToolsDeclared:        s.toolsDeclared,
+		DegradeEmptyToolTurn: s.degradeEmptyToolTurn,
 	}
 }
 
@@ -495,8 +500,42 @@ func noteVisibleContent(state *qualityScanState, text string) {
 	state.visibleRunes += utf8.RuneCountInString(text)
 }
 
-func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, string, error) {
+// QualityStreamEvidence 是 peek 结束时回传的质量证据，只用于降智归因，
+// 不包含任何上游正文或凭据。
+type QualityStreamEvidence struct {
+	// HasThinking 表示确实观察到思考增量或达到密文下限的推理内容。
+	HasThinking bool
+	// SemanticOutput 表示流里出现过工具调用/函数调用等非文本输出。
+	SemanticOutput bool
+	// Terminal 表示流已经出现结束标记。
+	Terminal bool
+	// HasVisible 与 VisibleFlushMS 描述首个可见 token 到判定时刻的生成窗口，
+	// 用于把缓冲倾倒/测量伪影（SHAPE）从账号/节点统计里剔除。
+	HasVisible     bool
+	VisibleFlushMS int64
+}
+
+// QualityPeekOptions 是质量守卫流的附加输入与输出。ToolsDeclared 只读：
+// 请求体声明了非空 tools；Evidence 由 peek 在返回时填充。
+type QualityPeekOptions struct {
+	ToolsDeclared bool
+	Evidence      QualityStreamEvidence
+}
+
+func (s *qualityScanState) evidence() QualityStreamEvidence {
+	signals := s.signals()
+	return QualityStreamEvidence{
+		HasThinking: signals.HasThinking, SemanticOutput: signals.SemanticOutput, Terminal: signals.Terminal,
+		HasVisible: signals.FirstVisible, VisibleFlushMS: signals.VisibleFlushMS,
+	}
+}
+
+func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime, options ...*QualityPeekOptions) (io.ReadCloser, QualityVerdict, Usage, string, error) {
 	cfg = normalizeQualityRetry(cfg)
+	var option *QualityPeekOptions
+	if len(options) > 0 {
+		option = options[0]
+	}
 	if body == nil {
 		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, "", errQualityEmptyStream
 	}
@@ -505,6 +544,11 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 		protocol:                        protocol,
 		minEncryptedBytes:               cfg.MinEncryptedBytes,
 		encryptedBytesPerReasoningToken: cfg.EncryptedBytesPerReasoningToken,
+		degradeEmptyToolTurn:            cfg.DegradeEmptyToolTurn,
+	}
+	if option != nil {
+		state.toolsDeclared = option.ToolsDeclared
+		defer func() { option.Evidence = state.evidence() }()
 	}
 	var held bytes.Buffer
 	holdTimer := time.NewTimer(cfg.HoldTimeout)

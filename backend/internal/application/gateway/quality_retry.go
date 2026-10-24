@@ -18,7 +18,10 @@ import (
 )
 
 const (
-	ErrorQualityDegraded                   = "quality_degraded"
+	ErrorQualityDegraded = "quality_degraded"
+	// ErrorQualityDegradedNoAccount 表示归因确认降智、但重试期间候选账号已全部
+	// 进入冷却。仍然返回 503，绝不用劣质响应冒充成功。
+	ErrorQualityDegradedNoAccount          = "quality_degraded_no_account"
 	qualityRetryFailOpen                   = "fail_open"
 	qualityRetryFailClosed                 = "fail_closed"
 	defaultQualityMaxAttempts              = 6
@@ -70,6 +73,35 @@ type QualityRetryRuntime struct {
 	HardTPS                         float64
 	MinGenerationMS                 int64
 	FailClosed                      bool
+	// DegradeAttributionEnabled 打开降智归因与分类处置。零值保持历史行为
+	// （每次 Withhold 无条件冷却/禁用账号），生产配置默认开启。
+	DegradeAttributionEnabled bool
+	// DegradationMode 是灰度开关：observe（默认）只算归因/写日志、不产生处置
+	// 副作用；enforce 才隔离租约/冷却禁用账号/关节点调度。
+	DegradationMode         string
+	DegradeWindow           time.Duration
+	DegradeMinSamples       int
+	DegradeAccountThreshold float64
+	DegradeNodeThreshold    float64
+	DegradeNodeMinAccounts  int
+	// DegradeMaxAttributionInputTokens 是计入归因统计的输入 token 上限；
+	// 超过它的命中只打 context_large 观测标签，不参与账号/节点统计（线上
+	// 1 天数据里 input≈130k 的请求 92% 无推理是相关而非因果，成因待定位）。
+	DegradeMaxAttributionInputTokens int64
+	// DegradeShapeMinGenerationMS 以下的生成窗口视为缓冲倾倒/测量伪影（SHAPE），
+	// 只跳过一次归因统计，不惩罚账号或节点。
+	DegradeShapeMinGenerationMS int64
+	DegradeAccountCooldowns     []time.Duration
+	DegradeMaxStrikes           int
+	// DegradeQuarantineDuration 是账号×出口节点租约隔离（首选处置）的时长。
+	DegradeQuarantineDuration time.Duration
+	DegradeUnknownCooldown    time.Duration
+	// DegradeGlobalSuppressThreshold 是全局退化率抑制线：全站普遍退化时不再
+	// 逐账号/节点处置，避免把上游整体故障误判成大量坏账号。
+	DegradeGlobalSuppressThreshold float64
+	// DegradeEmptyToolTurn 拦截「声明了 tools 却没有工具调用、没有推理、
+	// 可见与总输出都低于 MinOutputTokens」的空转收尾。必须保持窄。
+	DegradeEmptyToolTurn bool
 }
 
 // QualityStreamSignals is the hold classifier input. Tests drive this
@@ -91,6 +123,11 @@ type QualityStreamSignals struct {
 	VisibleFlushMS   int64
 	Terminal         bool
 	HoldExpired      bool
+	// SemanticOutput 表示流里出现过工具调用、函数调用或非文本输出项。
+	SemanticOutput bool
+	// ToolsDeclared 表示请求体声明了非空 tools；DegradeEmptyToolTurn 是策略开关。
+	ToolsDeclared        bool
+	DegradeEmptyToolTurn bool
 }
 
 // QualityVerdict is the hold decision for one upstream stream.
@@ -143,6 +180,19 @@ func normalizeQualityRetry(cfg QualityRetryRuntime) QualityRetryRuntime {
 	if cfg.MinGenerationMS <= 0 {
 		cfg.MinGenerationMS = audit.DefaultDegradeMinGenMS
 	}
+	cfg.DegradationMode = normalizeDegradationMode(cfg.DegradationMode)
+	cfg.DegradeWindow = normalizeDegradeWindow(cfg.DegradeWindow)
+	cfg.DegradeMinSamples = normalizeDegradeMinSamples(cfg.DegradeMinSamples)
+	cfg.DegradeAccountThreshold = normalizeDegradeThreshold(cfg.DegradeAccountThreshold, defaultDegradeAccountThreshold)
+	cfg.DegradeNodeThreshold = normalizeDegradeThreshold(cfg.DegradeNodeThreshold, defaultDegradeNodeThreshold)
+	cfg.DegradeNodeMinAccounts = normalizeDegradeNodeMinAccounts(cfg.DegradeNodeMinAccounts)
+	cfg.DegradeMaxAttributionInputTokens = normalizeDegradeTokenLimit(cfg.DegradeMaxAttributionInputTokens, defaultDegradeMaxAttributionInputTokens)
+	cfg.DegradeShapeMinGenerationMS = normalizeDegradeGenWindowMS(cfg.DegradeShapeMinGenerationMS)
+	cfg.DegradeAccountCooldowns = normalizeDegradeLadder(cfg.DegradeAccountCooldowns)
+	cfg.DegradeMaxStrikes = normalizeDegradeMaxStrikes(cfg.DegradeMaxStrikes)
+	cfg.DegradeQuarantineDuration = normalizeDegradeCooldown(cfg.DegradeQuarantineDuration, defaultDegradeQuarantineDuration)
+	cfg.DegradeUnknownCooldown = normalizeDegradeCooldown(cfg.DegradeUnknownCooldown, defaultDegradeUnknownCooldown)
+	cfg.DegradeGlobalSuppressThreshold = normalizeDegradeSuppressThreshold(cfg.DegradeGlobalSuppressThreshold)
 	cfg.OnExhausted = normalizeQualityExhaustionPolicy(cfg.OnExhausted)
 	return cfg
 }
@@ -278,6 +328,26 @@ func qualityIsCipherDrool(sig QualityStreamSignals, minOutput int64) bool {
 	return false
 }
 
+// qualityIsEmptyToolTurn catches an agent turn that declared tools but ended
+// with a few-token plain-text response: no tool call, no reasoning, and both
+// the visible and total output stay under minOutput. Client agents close the
+// whole task on such a reply, so it cannot be a valid finish. The rule is
+// deliberately narrow: a normal text finish with >= minOutput tokens must stay
+// deliverable, otherwise every short completion would be withheld and retried
+// into a 503 storm on pools where most responses carry no reasoning tokens.
+func qualityIsEmptyToolTurn(sig QualityStreamSignals, minOutput int64) bool {
+	if minOutput <= 0 {
+		minOutput = defaultQualityMinOutput
+	}
+	if !sig.DegradeEmptyToolTurn || !sig.ToolsDeclared || !sig.Terminal || sig.SemanticOutput {
+		return false
+	}
+	if sig.HasThinking || sig.ReasoningTokens > 0 {
+		return false
+	}
+	return sig.VisibleTokens < minOutput && sig.OutputTokens < minOutput
+}
+
 // ClassifyQualityHold decides whether a held stream may be forwarded.
 // Dump detectors run first so plaintext thinking cannot veto a 1ms
 // reasoning-ratio dump, and vis<minOutput cannot skip fake-enc/burst.
@@ -287,7 +357,7 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	if minOutput <= 0 {
 		minOutput = defaultQualityMinOutput
 	}
-	if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) || qualityIsFastReasoningRatioDump(sig) {
+	if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) || qualityIsFastReasoningRatioDump(sig) || qualityIsEmptyToolTurn(sig, minOutput) {
 		return QualityWithhold
 	}
 	if sig.HasThinking {
@@ -315,6 +385,15 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 		output = sig.OutputTokens
 	}
 	enough := output >= minOutput
+	// 声明 tools 的 agent 回合按「工具调用 + 输出量」判定：线上 63%–99% 的
+	// Build 响应本来就没有 reasoning tokens，缺推理不能当降智证据（窄空转规则
+	// 已在上面处理）。否则几乎每个正常纯文本收尾都会被扣留并重试成 503。
+	if sig.ToolsDeclared && sig.DegradeEmptyToolTurn {
+		if enough || sig.Terminal {
+			return QualityDeliver
+		}
+		return QualityWait
+	}
 	if sig.ReasoningStarted && !sig.Terminal && !sig.HoldExpired {
 		return QualityWait
 	}
@@ -616,13 +695,19 @@ func (s *Service) applyOutputSpeedPenalty(ctx context.Context, record audit.Reco
 }
 
 func (s *Service) recordQualityDegraded(ctx context.Context, base audit.Record, credential accountdomain.Credential, usage Usage, startedAt time.Time, trace *infraegress.Trace, provider accountdomain.Provider) {
+	s.recordQualityFailure(ctx, base, credential, usage, startedAt, trace, provider, ErrorQualityDegraded)
+}
+
+// recordQualityFailure 写入一条质量失败审计记录，errorCode 用于区分
+// quality_degraded / context_window_exceeded 等不同失败语义。
+func (s *Service) recordQualityFailure(ctx context.Context, base audit.Record, credential accountdomain.Credential, usage Usage, startedAt time.Time, trace *infraegress.Trace, provider accountdomain.Provider, errorCode string) {
 	record := base
 	record.EventID = newAuditEventID()
 	accountID := credential.ID
 	record.AccountID = &accountID
 	record.AccountName = credential.Name
 	record.StatusCode = http.StatusOK
-	record.ErrorCode = ErrorQualityDegraded
+	record.ErrorCode = errorCode
 	record.OutputTokens = usage.OutputTokens
 	record.ReasoningTokens = usage.ReasoningTokens
 	record.TotalTokens = usage.TotalTokens

@@ -303,6 +303,53 @@ type QualityGuardRequestRetryConfig struct {
 	IdleAccountCooldown             Duration `yaml:"idleAccountCooldown"`
 	MinEncryptedBytes               int      `yaml:"minEncryptedBytes"`
 	EncryptedBytesPerReasoningToken int      `yaml:"encryptedBytesPerReasoningToken"`
+
+	// DegradeAttributionEnabled 把「质量守卫判定 Withhold」与「上游流式截断」两类
+	// 事件统一记为 degradation 事件，在内存滚动窗口内按账号/出口节点归因后分类
+	// 处置：账号问题先用账号×节点租约隔离，跨节点确认后才冷却/禁用账号；节点问题
+	// 只关闭节点调度；大上下文(CONTEXT)与测量伪影(SHAPE)不惩罚任何对象。
+	// 默认开启；关闭后退回历史的无条件账号冷却策略。
+	DegradeAttributionEnabled bool `yaml:"degradeAttributionEnabled"`
+	// DegradationMode 控制灰度开关：observe（默认）只计算归因并写日志（action=
+	// observe_only，would_action 记录 enforce 会做什么），不隔离租约、不冷却/
+	// 禁用账号、不关闭节点调度；enforce 才执行副作用。
+	// fail_closed（退化响应不以 200 交付）与该开关无关，始终生效。
+	DegradationMode string `yaml:"degradationMode"`
+	// DegradeWindow 是滚动统计的时间窗口，窗口外的样本自然过期。
+	DegradeWindow Duration `yaml:"degradeWindow"`
+	// DegradeMinSamples 是账号/节点参与归因所需的最小事件样本数。
+	DegradeMinSamples int `yaml:"degradeMinSamples"`
+	// DegradeAccountThreshold 是账号自身退化率阈值（0, 1]。
+	DegradeAccountThreshold float64 `yaml:"degradeAccountThreshold"`
+	// DegradeNodeThreshold 是出口节点退化率阈值（0, 1]，必须比账号阈值更严格。
+	DegradeNodeThreshold float64 `yaml:"degradeNodeThreshold"`
+	// DegradeNodeMinAccounts 是判定 NODE 前该节点上最少的不同账号数。
+	DegradeNodeMinAccounts int `yaml:"degradeNodeMinAccounts"`
+	// DegradeMaxAttributionInputTokens 是计入归因统计的输入 token 上限；
+	// 达到它的命中只打 context_large 观测标签，不参与账号/节点统计（线上 1 天
+	// 数据里 input≈130k 的请求 92% 无推理是相关而非因果，成因待定位）。
+	// 注意：大上下文不会改变请求的重试/失败路径，不存在上下文硬上限。
+	DegradeMaxAttributionInputTokens int `yaml:"degradeMaxAttributionInputTokens"`
+	// DegradeShapeMinGenerationMS 以下的生成窗口（duration - firstToken）视为
+	// 缓冲倾倒/测量伪影（SHAPE），跳过归因统计、不惩罚任何对象。
+	DegradeShapeMinGenerationMS int `yaml:"degradeShapeMinGenerationMS"`
+	// DegradeAccountCooldownLadder 是账号冷却阶梯，按连续命中次数依次取用，
+	// 用尽后重复最后一档。默认 5m → 15m → 1h。
+	DegradeAccountCooldownLadder []Duration `yaml:"degradeAccountCooldownLadder"`
+	// DegradeMaxStrikes 是判定账号失效前的连续归因命中次数。
+	DegradeMaxStrikes int `yaml:"degradeMaxStrikes"`
+	// DegradeQuarantineDuration 是账号×出口节点租约隔离（首选处置）的时长。
+	DegradeQuarantineDuration Duration `yaml:"degradeQuarantineDuration"`
+	// DegradeUnknownCooldown 是归因证据不足时只施加的短冷却。
+	DegradeUnknownCooldown Duration `yaml:"degradeUnknownCooldown"`
+	// DegradeGlobalSuppressThreshold 是全局退化率抑制线：全站普遍退化时不再
+	// 逐账号/节点处置，避免把上游整体故障误判成大量坏账号。
+	DegradeGlobalSuppressThreshold float64 `yaml:"degradeGlobalSuppressThreshold"`
+	// DegradeEmptyToolTurn 只拦截「声明了 tools 的请求收到不可能有效收尾的空转响应」：
+	// 没有工具调用、没有推理、可见与总输出都低于 minOutputTokens。默认开启。
+	// 该规则必须保持窄，放宽到「输出 >= minOutputTokens 也算」会把正常纯文本收尾
+	// 全部扣留 → 重试耗尽 → 大面积 503。
+	DegradeEmptyToolTurn bool `yaml:"degradeEmptyToolTurn"`
 }
 
 type ClientKeyDefaultsConfig struct {
@@ -798,6 +845,9 @@ func validateQualityGuardConfig(value QualityGuardConfig) error {
 }
 
 func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) error {
+	if err := validateDegradeAttribution(value); err != nil {
+		return err
+	}
 	if !value.Enabled && !value.AutoDisable {
 		return nil
 	}
@@ -826,6 +876,58 @@ func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) erro
 	}
 	if value.EncryptedBytesPerReasoningToken != 0 && (value.EncryptedBytesPerReasoningToken < 1 || value.EncryptedBytesPerReasoningToken > 16) {
 		return errors.New("qualityGuard.requestRetry.encryptedBytesPerReasoningToken 必须在 1 到 16 之间")
+	}
+	return nil
+}
+
+// validateDegradeAttribution 校验降智归因参数。零值表示使用代码默认值，
+// 因此只有显式配置的非法取值会被拒绝。
+func validateDegradeAttribution(value QualityGuardRequestRetryConfig) error {
+	switch strings.ToLower(strings.TrimSpace(value.DegradationMode)) {
+	case "", "observe", "enforce":
+	default:
+		return errors.New("qualityGuard.requestRetry.degradationMode 必须是 observe 或 enforce")
+	}
+	if d := value.DegradeWindow.Value(); d != 0 && (d < 30*time.Second || d > 24*time.Hour) {
+		return errors.New("qualityGuard.requestRetry.degradeWindow 必须在 30s 到 24h 之间")
+	}
+	if value.DegradeMinSamples != 0 && (value.DegradeMinSamples < 2 || value.DegradeMinSamples > 1000) {
+		return errors.New("qualityGuard.requestRetry.degradeMinSamples 必须在 2 到 1000 之间")
+	}
+	if value.DegradeAccountThreshold != 0 && !(value.DegradeAccountThreshold > 0 && value.DegradeAccountThreshold <= 1) {
+		return errors.New("qualityGuard.requestRetry.degradeAccountThreshold 必须在 (0, 1] 之间")
+	}
+	if value.DegradeNodeThreshold != 0 && !(value.DegradeNodeThreshold > 0 && value.DegradeNodeThreshold <= 1) {
+		return errors.New("qualityGuard.requestRetry.degradeNodeThreshold 必须在 (0, 1] 之间")
+	}
+	if value.DegradeAccountThreshold != 0 && value.DegradeNodeThreshold != 0 && value.DegradeNodeThreshold <= value.DegradeAccountThreshold {
+		return errors.New("qualityGuard.requestRetry.degradeNodeThreshold 必须大于 degradeAccountThreshold")
+	}
+	if value.DegradeNodeMinAccounts != 0 && (value.DegradeNodeMinAccounts < 2 || value.DegradeNodeMinAccounts > 100) {
+		return errors.New("qualityGuard.requestRetry.degradeNodeMinAccounts 必须在 2 到 100 之间")
+	}
+	if value.DegradeMaxAttributionInputTokens != 0 && (value.DegradeMaxAttributionInputTokens < 1000 || value.DegradeMaxAttributionInputTokens > 1000000) {
+		return errors.New("qualityGuard.requestRetry.degradeMaxAttributionInputTokens 必须在 1000 到 1000000 之间")
+	}
+	if value.DegradeShapeMinGenerationMS != 0 && (value.DegradeShapeMinGenerationMS < 0 || value.DegradeShapeMinGenerationMS > 60000) {
+		return errors.New("qualityGuard.requestRetry.degradeShapeMinGenerationMS 必须在 0 到 60000 之间")
+	}
+	for _, item := range value.DegradeAccountCooldownLadder {
+		if d := item.Value(); d < 30*time.Second || d > 168*time.Hour {
+			return errors.New("qualityGuard.requestRetry.degradeAccountCooldownLadder 每档必须在 30s 到 168h 之间")
+		}
+	}
+	if value.DegradeMaxStrikes != 0 && (value.DegradeMaxStrikes < 1 || value.DegradeMaxStrikes > 10) {
+		return errors.New("qualityGuard.requestRetry.degradeMaxStrikes 必须在 1 到 10 之间")
+	}
+	if d := value.DegradeQuarantineDuration.Value(); d != 0 && (d < 30*time.Second || d > 24*time.Hour) {
+		return errors.New("qualityGuard.requestRetry.degradeQuarantineDuration 必须在 30s 到 24h 之间")
+	}
+	if d := value.DegradeUnknownCooldown.Value(); d != 0 && (d < 30*time.Second || d > 24*time.Hour) {
+		return errors.New("qualityGuard.requestRetry.degradeUnknownCooldown 必须在 30s 到 24h 之间")
+	}
+	if value.DegradeGlobalSuppressThreshold != 0 && !(value.DegradeGlobalSuppressThreshold > 0 && value.DegradeGlobalSuppressThreshold <= 1) {
+		return errors.New("qualityGuard.requestRetry.degradeGlobalSuppressThreshold 必须在 (0, 1] 之间")
 	}
 	return nil
 }
@@ -963,6 +1065,18 @@ func defaultConfig() Config {
 				MaxAttempts: 6, HoldTimeout: Duration(30 * time.Second), MinOutputTokens: 8, OnExhausted: "fail_closed",
 				AccountCooldown: Duration(12 * time.Hour), IdleAccountCooldown: Duration(15 * time.Minute),
 				MinEncryptedBytes: 256, EncryptedBytesPerReasoningToken: 4,
+				// 降智归因默认开启：线上 direct 出口 99% 请求没有推理，必须靠
+				// 账号×节点交叉证据区分「账号降智」与「出口节点降智」。
+				// 50k/500ms 分层参数来自 1 天线上定标，见
+				// ops47/degrade-attribution-data.md。灰度期默认只观察不处置。
+				DegradeAttributionEnabled: true, DegradationMode: "observe",
+				DegradeWindow: Duration(30 * time.Minute), DegradeMinSamples: 5,
+				DegradeAccountThreshold: 0.6, DegradeNodeThreshold: 0.8, DegradeNodeMinAccounts: 2,
+				DegradeMaxAttributionInputTokens: 50000, DegradeShapeMinGenerationMS: 500,
+				DegradeAccountCooldownLadder: []Duration{Duration(5 * time.Minute), Duration(15 * time.Minute), Duration(time.Hour)},
+				DegradeMaxStrikes:            3, DegradeQuarantineDuration: Duration(15 * time.Minute), DegradeUnknownCooldown: Duration(2 * time.Minute),
+				DegradeGlobalSuppressThreshold: 0.9,
+				DegradeEmptyToolTurn:           true,
 			},
 		},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},

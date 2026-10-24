@@ -183,3 +183,61 @@ qualityGuard:
     idleAccountCooldown: 15m
     minEncryptedBytes: 256
     encryptedBytesPerReasoningToken: 4
+    # 降智归因与分类处置：把「质量守卫判定 Withhold」与「上游流式截断」
+    # (upstream_stream_incomplete) 统一记为 degradation 事件，在内存滚动窗口内
+    # 按账号/出口节点分别统计退化率，再决定处置方式（reason 字段）：
+    #   ACCOUNT  账号退化率达到阈值 → 第一档只隔离该账号在当前出口节点的租约
+    #            (account_egress_lease_blocks)；同一账号在 >=2 个不同节点被判定后
+    #            才升级为账号冷却阶梯，连续命中 degradeMaxStrikes 次后禁用账号
+    #            （lastError=degraded_account）。
+    #   NODE     节点退化率达到阈值且该节点上多数账号(NODE_MIN_ACCOUNTS 起)也退化
+    #            → 只关闭节点调度（UpdateManyEnabled(false)），不惩罚账号、不写
+    #            节点健康度。
+    #   CONTEXT  input_tokens 达到 degradeMaxAttributionInputTokens 的命中只打
+    #            context_large 观测标签：不计入账号/节点统计、不惩罚任何对象。
+    #            大上下文不会改变请求的重试/失败路径（实测上游无 128k 硬上限，
+    #            input≈130k 的请求 92% 无推理是相关而非因果，成因待定位）。
+    #   SHAPE    生成窗口（duration - firstToken）< degradeShapeMinGenerationMS 的
+    #            命中是缓冲倾倒/测量伪影：跳过统计、不惩罚任何对象。
+    #   UNKNOWN  证据不足（样本不够、全局抑制或只有节点证据）→ 只做一次短冷却。
+    # 为什么不能只用 reasoning_tokens=0：线上 direct 出口 99%、proxy 节点 63%–99%
+    # 的响应本来就没有推理；1 天定标显示用「reason0 & out>=32」当命中会把 12 个
+    # 被测账号里的 8 个在 24h 内误杀。
+    # 关闭后退回历史的「每次 Withhold 无条件冷却/禁用账号」策略。
+    # 运营注意：打开后 fail_open 的「交付最后一次」会被强制升级为 503，退化响应
+    # 绝不以 200 交付。
+    degradeAttributionEnabled: true
+    # 灰度开关（默认 observe）：
+    #   observe  照常计算归因、命中统计与结构化日志，但**不执行任何处置副作用**：
+    #            不隔离租约、不冷却/禁用账号、不关闭节点调度。日志里
+    #            action=observe_only，would_action=如果 enforce 会执行的动作。
+    #   enforce  按上面的策略执行处置。
+    # 注意：fail_closed（退化响应不以 200 交付）与该开关无关，始终生效。
+    degradationMode: observe
+    # 滚动窗口时长与参与归因所需的最小样本数（定标值 5，不是 8）。
+    degradeWindow: 30m
+    degradeMinSamples: 5
+    # 账号阈值、节点阈值（节点阈值必须更严格）与判定 NODE 的最少不同账号数。
+    degradeAccountThreshold: 0.6
+    degradeNodeThreshold: 0.8
+    degradeNodeMinAccounts: 2
+    # 命中分层：>=50k 输入的命中只打 context_large 观测标签（不入账号/节点统计，
+    # 但不影响重试）；生成窗口 <500ms 的命中归为 SHAPE（不入统计）。
+    degradeMaxAttributionInputTokens: 50000
+    degradeShapeMinGenerationMS: 500
+    # 账号冷却阶梯：按连续归因命中次数依次取用，用尽后重复最后一档。
+    degradeAccountCooldownLadder: ["5m", "15m", "1h"]
+    degradeMaxStrikes: 3
+    # 账号×节点租约隔离时长（不写账号/节点健康度）。
+    degradeQuarantineDuration: 15m
+    # 归因证据不足时的短冷却，不禁用、不隔离节点。
+    degradeUnknownCooldown: 2m
+    # 全局退化率抑制线：全站普遍退化（上游整体故障）时不再逐账号/节点处置。
+    degradeGlobalSuppressThreshold: 0.9
+    # 「agent 任务不许静默结束」：声明了非空 tools 的请求，若流结束时既没有
+    # tool_call/function_call、也没有推理（reasoning_tokens=0 且无思考增量），
+    # 且可见与总输出都低于 minOutputTokens，则判为降智/上游异常并换号重试，
+    # 绝不把这种空转响应当 200 交付。
+    # 该规则必须保持窄：放宽成「输出 >= minOutputTokens 也算」会把正常纯文本
+    # 收尾全部扣留 → 重试耗尽 → 大面积 503。关闭即恢复旧的收尾判定。
+    degradeEmptyToolTurn: true

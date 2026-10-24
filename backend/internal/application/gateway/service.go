@@ -228,6 +228,13 @@ type Service struct {
 	modelSyncing                map[uint64]struct{}
 	markBuildChatDeniedAsReauth atomic.Bool
 	qualityRetry                atomic.Pointer[QualityRetryRuntime]
+	// degrade 是降智归因的进程内滚动窗口统计；egressLeases/egressNodes/egressNodeLookup
+	// 复用既有租约隔离、节点调度开关与只读节点查询（装配期注入，运行期只读），
+	// 不新建存储。
+	degrade          *degradationTracker
+	egressLeases     egressLeaseQuarantiner
+	egressNodes      egressNodeDisabler
+	egressNodeLookup egressNodeLookup
 }
 
 type teamModelRateLimit struct {
@@ -267,6 +274,7 @@ func NewService(models routeResolver, audits auditRecorder, accounts *accountapp
 		selector: selector, responses: responses, logger: slog.Default(),
 		rateLimits: make(map[string]teamModelRateLimit), rateLimitTeams: make(map[uint64]teamRateLimitObservation),
 		modelSyncing: make(map[uint64]struct{}),
+		degrade:      newDegradationTracker(),
 	}
 	service.UpdateMaxAttempts(maxAttempts)
 	return service
@@ -1021,6 +1029,9 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	holdCfg := s.qualityRetryConfig()
 	qualityHoldEnabled := shouldHoldQualityStream(input, ownership, route, operation, holdCfg)
 	qualityCrossAccountReplay := canReplayQualityHoldAcrossAccounts(input, ownership)
+	// 「声明了 tools 却没产出工具调用」的空转判定需要请求体声明，只在开关打开时
+	// 解析一次请求体，不参与逐帧扫描。
+	qualityToolsDeclared := qualityHoldEnabled && holdCfg.DegradeEmptyToolTurn && qualityRequestDeclaresTools(input.Body)
 	attemptPolicy := newRequestRoutingAttemptPolicy(int(s.maxAttempts.Load()), ownership != nil || input.ForcedAccountID != 0)
 	idempotencyID, _ := security.NewOpaqueToken(18)
 	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
@@ -1038,6 +1049,9 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	// Count accounts that actually reached the upstream. Credential-only skips
 	// do not consume the quality retry budget; refreshes stay on the same account.
 	qualityAccountAttempts := 0
+	// qualityDegradedSeen 记录本次请求已确认过退化响应；重试期间候选全部冷却时
+	// 用它返回 quality_degraded_no_account，而不是退回劣质响应冒充 200。
+	qualityDegradedSeen := false
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
 	quotaProbeAttempted := false
 	selection := preselectedSession
@@ -1080,6 +1094,21 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 						return s.selector.MarkFailureAfterSuccess(stageCtx, credential, status, retryAfter)
 					}); err != nil {
 						s.logger.Warn("stream_failure_health_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
+					}
+					// 上游截断与质量守卫 Withhold 同为退化信号，统一进入降智归因。
+					// 注意：这里只能记录/隔离，不能改审计状态码——2xx 响应头已交给客户端。
+					if errorCode == errorCodeUpstreamStreamIncomplete {
+						attributionCfg := s.qualityRetryConfig()
+						if attributionCfg.DegradeAttributionEnabled {
+							if err := budget.run("degrade_attribution", finalizationHealthBudget, func(stageCtx context.Context) error {
+								durationMS := time.Since(startedAt).Milliseconds()
+								hit := newTruncationDegradationHit(credential, egressTrace, route.Provider, usage, durationMS, firstToken.milliseconds())
+								s.observeDegradationHit(stageCtx, input.RequestID, credential, hit, usage, attributionCfg)
+								return nil
+							}); err != nil {
+								s.logger.Warn("degradation_attribution_failed", "request_id", input.RequestID, "account_id", credential.ID, "error", err)
+							}
+						}
 					}
 				}
 				lease.Release()
@@ -1598,7 +1627,8 @@ attemptLoop:
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
 			if qualityHoldEnabled {
-				replay, verdict, peekUsage, _, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
+				peekOptions := &QualityPeekOptions{ToolsDeclared: qualityToolsDeclared}
+				replay, verdict, peekUsage, _, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg, peekOptions)
 				if peekErr != nil {
 					if replay != nil {
 						_ = replay.Close()
@@ -1640,7 +1670,23 @@ attemptLoop:
 				}
 				commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
 				if verdict == QualityWithhold {
-					s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown, holdCfg.AutoDisable)
+					qualityDegradedSeen = true
+					if holdCfg.DegradeAttributionEnabled {
+						// 归因模式硬 fail_closed：退化响应绝不以 200 交付，
+						// 因此 fail_open 的「交付最后一次」被升级为拒绝。
+						if commit.Action == QualityActionDeliverLast {
+							commit = QualityCommit{Action: QualityActionReject, Audit: true, KeepBody: false}
+						}
+						// 只做观测/分类处置，不改变本次请求的重试路径：大上下文
+						// 只打 context_large 标签，不会因为上下文大而报错。
+						hit := newWithholdDegradationHit(credential, egressTrace, route.Provider, peekUsage, peekOptions.Evidence)
+						s.observeDegradationHit(ctx, input.RequestID, credential, hit, peekUsage, holdCfg)
+					} else {
+						s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown, holdCfg.AutoDisable)
+					}
+				} else if holdCfg.DegradeAttributionEnabled {
+					// 正常交付样本进入比例分母；带推理证据的成功会清零冷却阶梯。
+					s.observeHealthyQualitySample(credential, egressTrace, route.Provider, peekUsage, peekOptions.Evidence)
 				}
 				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
 				if commit.Audit && !deferFailOpenAudit {
@@ -1718,6 +1764,14 @@ attemptLoop:
 			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt), nil
 		}
 		discardFallback(true)
+	}
+	if lastFailure == nil && qualityDegradedSeen {
+		// 已确认降智但重试期间候选账号全部冷却：明确返回独立错误码，
+		// 绝不回退到劣质响应冒充 200。
+		lastFailure = &UpstreamFailure{
+			HTTPStatus: http.StatusServiceUnavailable, Code: ErrorQualityDegradedNoAccount,
+			PublicMessage: "降智响应已确认，候选账号均在冷却", Cause: errQualityDegraded,
+		}
 	}
 	if lastFailure != nil {
 		record := auditBase

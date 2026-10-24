@@ -116,6 +116,9 @@ const (
 const (
 	LastErrorMissingThinking         = "missing_thinking"
 	LastErrorMissingThinkingDisabled = "missing_thinking_disabled"
+	// LastErrorDegradedAccount 是降智归因确认账号问题后的健康标记：冷却或禁用
+	// 都会写入该标记，便于运营面板区分「无推理退化」与普通上游失败。
+	LastErrorDegradedAccount = "degraded_account"
 )
 
 // LastErrorConsoleUnlinked is the reauth reason recorded for grok_console
@@ -126,7 +129,7 @@ const LastErrorConsoleUnlinked = "grok_console account has no credits or license
 // NormalizeHealthMarker admits only durable non-sensitive health markers.
 func NormalizeHealthMarker(value string) string {
 	switch value {
-	case LastErrorMissingThinking, LastErrorMissingThinkingDisabled:
+	case LastErrorMissingThinking, LastErrorMissingThinkingDisabled, LastErrorDegradedAccount:
 		return value
 	default:
 		return ""
