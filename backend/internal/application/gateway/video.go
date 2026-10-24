@@ -81,6 +81,9 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 		hasRefs := len(input.ReferenceURLs) > 0
 		hasRefAudio := len(input.ReferenceAudios) > 0
 		if hasImage && (hasRefs || hasRefAudio) {
+			// 官方契约：image（首帧）与 reference_images 互斥。Grok Web 通道的
+			// 「首尾帧」在公开入口因此只能写成 reference_images=[首帧, 尾帧]，
+			// 由 Web adapter 的 videoFrameSources 解释（见 infra/provider/web/video.go）。
 			return media.Job{}, fmt.Errorf("image 不能与 reference_images/reference_audios 同时使用")
 		}
 		if hasRefs || hasRefAudio {
@@ -230,7 +233,9 @@ func routesForVideoParameters(routes []model.Route, operation provider.VideoOper
 	return compatible, nil
 }
 
-// Console 视频输入的上限与时长按「Provider + 入口字段 + 上游模型」分档。
+// 视频输入的上限与时长按「Provider + 入口字段 + 上游模型」分档：
+// Console 按 reference_images 数量与 duration 分档，Web 按图片数量
+// （0 张文本 / 1 张首帧 / 2 张首尾帧）分档。
 // /v1/videos/generations 是异步接口，只在 adapter 层拦截会产出必然失败的任务；
 // adapter 仍保留同一约束，作为最终出站边界的防御校验。
 func validateVideoRouteParameters(providerValue account.Provider, operation provider.VideoOperation, upstreamModel, resolution string, hasImage bool, referenceCount, duration int) error {
@@ -239,10 +244,17 @@ func validateVideoRouteParameters(providerValue account.Provider, operation prov
 	}
 	trimmedModel := strings.TrimSpace(upstreamModel)
 	hasReferences := referenceCount > 0
-	if providerValue == account.ProviderWeb && (hasImage || hasReferences) {
-		return fmt.Errorf("%w: Grok Web 当前仅支持文本生视频；图片视频请使用 Build 或 Console Provider", ErrVideoOperationUnsupported)
-	}
-	if providerValue == account.ProviderConsole && (trimmedModel == "grok-imagine-video" || trimmedModel == "grok-imagine-video-1.5") {
+	if providerValue == account.ProviderWeb {
+		// Web 视频走 imagine 对话通道，支持三种 mediaGenInput：
+		//   无图 -> textToVideo；1 张图（image 或单张 reference_images）-> imageToVideo
+		//   （首帧，useFirstFrame）；2 张图 -> referenceToVideo（firstFrameAsset +
+		//   lastFrameAsset，即首帧 + 尾帧）。
+		// 上游 referenceToVideo 的 inputAssets 固定为空数组，没有风格参考槽位，
+		// 超过两张图没有可表达的请求形状，因此在入队前直接拒绝。
+		if referenceCount > 2 {
+			return fmt.Errorf("%w: Grok Web 首尾帧生视频最多支持 2 张图片（首帧 + 尾帧），当前为 %d 张", ErrVideoOperationUnsupported, referenceCount)
+		}
+	} else if providerValue == account.ProviderConsole && (trimmedModel == "grok-imagine-video" || trimmedModel == "grok-imagine-video-1.5") {
 		// 实测：8 张 reference_images 上游回 400
 		// "Too many reference images: 8. Maximum allowed is 7."（两个视频模型一致）。
 		if referenceCount > provider.ConsoleVideoMaxReferenceImages {

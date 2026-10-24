@@ -205,15 +205,27 @@ func TestVideoRouteParametersRejectConsoleReferenceLimits(t *testing.T) {
 	if err := validateVideoRouteParameters(account.ProviderBuild, provider.VideoOperationGenerate, "grok-imagine-video-1.5", "720p", false, 8, 15); err != nil {
 		t.Fatalf("Build 1.5 references error = %v", err)
 	}
-	// Web 新协议只有文本生视频抓包证据；不能退回已删除的 media-post 旧链路。
+	// Web 新协议现已支持图生视频（单首帧）与首尾帧：1 张图 = imageToVideo，
+	// 2 张图 = referenceToVideo 的 firstFrameAsset + lastFrameAsset。
 	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", false, 0, 15); err != nil {
 		t.Fatalf("Web text video error = %v", err)
 	}
-	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", true, 0, 6); !errors.Is(err, ErrVideoOperationUnsupported) {
-		t.Fatalf("Web image video error = %v", err)
+	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", true, 0, 6); err != nil {
+		t.Fatalf("Web first-frame video error = %v", err)
 	}
-	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", false, 1, 6); !errors.Is(err, ErrVideoOperationUnsupported) {
-		t.Fatalf("Web reference video error = %v", err)
+	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", false, 1, 6); err != nil {
+		t.Fatalf("Web single-reference video error = %v", err)
+	}
+	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "480p", false, 2, 6); err != nil {
+		t.Fatalf("Web first/last frame video error = %v", err)
+	}
+	// referenceToVideo.inputAssets 固定为空，没有风格参考槽位，三张图没有可表达的请求形状。
+	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "480p", false, 3, 6); !errors.Is(err, ErrVideoOperationUnsupported) {
+		t.Fatalf("Web three-frame video error = %v", err)
+	}
+	// Web 免费档没有 1080p，上游模型名也不是 1.5。
+	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "1080p", false, 2, 6); !errors.Is(err, ErrVideoOperationUnsupported) {
+		t.Fatalf("Web 1080p frame video error = %v", err)
 	}
 }
 

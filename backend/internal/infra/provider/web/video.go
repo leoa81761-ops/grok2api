@@ -19,6 +19,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
+	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
 
@@ -253,10 +254,16 @@ func boundWebMediaDiagnostic(value string, limit int) string {
 }
 
 func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
-	if strings.TrimSpace(request.ImageURL) != "" || len(request.ReferenceURLs) > 0 {
-		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Grok Web 当前仅支持文本生视频；图片视频请使用 Build 或 Console Provider"))
+	// 首/尾帧映射与上限见 videoFrameSources：0 张 -> 文生视频，1 张 -> 图生视频
+	// （首帧），2 张 -> 首尾帧（referenceToVideo.firstFrameAsset/lastFrameAsset）。
+	frames, err := videoFrameSources(request.ImageURL, request.ReferenceURLs)
+	if err != nil {
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
 	}
 	cfg := a.config()
+	if len(videoSegments(request.Duration)) == 0 {
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("duration 必须在 1 到 15 秒之间"))
+	}
 	token, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
 	if err != nil {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
@@ -266,9 +273,6 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
 	}
 	defer lease.Release()
-	if len(videoSegments(request.Duration)) == 0 {
-		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("duration 必须在 1 到 15 秒之间"))
-	}
 	seconds := applyFreeWebVideoDurationCap(request.Duration, cfg.FreeVideoDurationCap, request.Credential)
 	segments := videoSegments(seconds)
 	ratio := resolveAspectRatio(request.AspectRatio)
@@ -276,7 +280,17 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	if resolution == "" {
 		resolution = "720p"
 	}
-	payload := videoCreatePayload(request.Prompt, ratio, resolution, segments[0])
+	// 帧图片必须先上传成资产 id：conversations/new 只接受 imageToVideo.inputAssets /
+	// referenceToVideo.firstFrameAsset|lastFrameAsset 里的 asset 引用，不接受图片 URL。
+	assets, err := a.uploadVideoFrames(ctx, cfg, lease, token, frames)
+	if err != nil {
+		return provider.VideoResult{}, err
+	}
+	if len(assets) > 0 {
+		a.log().Info("web_video_frame_input",
+			"frame_count", len(assets), "duration", segments[0], "resolution", resolution)
+	}
+	payload := videoPayloadForFrames(request.Prompt, ratio, resolution, segments[0], assets)
 	response, err := a.postJSON(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
 	if err != nil {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
@@ -587,14 +601,73 @@ func applyFreeWebVideoDurationCap(seconds, cap int, credential account.Credentia
 	return seconds
 }
 
-// videoCreatePayload mirrors the current Grok Imagine browser request.
-// In particular, the generation parameters belong in mediaGenInput rather
-// than the legacy modelConfigOverride map. Keeping this shape explicit also
-// prevents text-to-video from depending on a synthetic media post.
-func videoCreatePayload(prompt, ratio, resolution string, seconds int) map[string]any {
+// videoFrameSources maps the public video request fields onto at most two frame
+// images, returned in [firstFrame, lastFrame] order.
+//
+// 映射约定（与 ops47/frame-video-impl.md 一致）：
+//   - 0 张图：文生视频（textToVideo）
+//   - 1 张图：图生视频（imageToVideo），该图是首帧，上游以 useFirstFrame 标记
+//   - 2 张图：首尾帧（referenceToVideo），firstFrameAsset + lastFrameAsset
+//
+// ImageURL 是官方 `image` 字段，始终代表首帧；此时 ReferenceURLs[0] 是尾帧。
+// 当前公开入口（/v1/videos/generations）仍按官方契约禁止 image 与
+// reference_images 同时出现，因此经 HTTP 到达这里的首尾帧请求实际形如
+// reference_images=[首帧, 尾帧]：Web 通道的 referenceToVideo.inputAssets 固定为
+// 空，没有"纯风格参考"槽位，所以两张参考图只能解释成首帧和尾帧。
+// 超过两张图在上游没有可表达的请求形状，直接拒绝而不是静默丢图。
+func videoFrameSources(imageURL string, referenceURLs []string) ([]string, error) {
+	frames := make([]string, 0, 2)
+	if value := strings.TrimSpace(imageURL); value != "" {
+		frames = append(frames, value)
+	}
+	for _, raw := range referenceURLs {
+		if value := strings.TrimSpace(raw); value != "" {
+			frames = append(frames, value)
+		}
+	}
+	if len(frames) > 2 {
+		return nil, fmt.Errorf("Grok Web 首尾帧生视频最多支持 2 张图片（首帧 + 尾帧），当前 %d 张", len(frames))
+	}
+	return frames, nil
+}
+
+// uploadVideoFrames turns the ordered frame sources into Imagine asset ids.
+// 复用既有对话附件链路（loadChatImage + prepareChatAttachments），不新增上传协议。
+// 逐张上传而不是合并成一次调用是有意的：prepareChatAttachments 会按内容去重，
+// 首帧和尾帧是同一张图时合并调用会把两张塌成一张、破坏首尾帧请求。
+func (a *Adapter) uploadVideoFrames(ctx context.Context, cfg Config, lease *infraegress.Lease, token string, frames []string) ([]string, error) {
+	if len(frames) == 0 {
+		return nil, nil
+	}
+	assets := make([]string, 0, len(frames))
+	for index, frame := range frames {
+		uploaded, err := a.prepareChatAttachments(ctx, cfg, lease, token, []chatAttachmentInput{{Source: frame, Image: true}})
+		if err != nil {
+			// 上游明确拒绝（4xx/5xx 带 HTTP 状态）沿用 create 阶段语义，让 gateway
+			// 的 403 refresh / 429 换号逻辑照常生效；本地图片校验或下载失败属于
+			// prepare，重试其它账号没有意义。
+			stage := provider.VideoStagePrepare
+			if _, hasStatus := provider.ErrorHTTPStatus(err); hasStatus {
+				stage = provider.VideoCreateFailureStage(err)
+			}
+			return nil, provider.WrapVideoStage(stage, 0, fmt.Errorf("上传视频第 %d 帧图片: %w", index+1, err))
+		}
+		if len(uploaded) != 1 || strings.TrimSpace(uploaded[0]) == "" {
+			return nil, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("上传视频第 %d 帧图片成功但上游未返回可用资产标识", index+1))
+		}
+		assets = append(assets, uploaded[0])
+	}
+	return assets, nil
+}
+
+// videoConversationPayload mirrors the current Grok Imagine browser request.
+// In particular, the generation parameters belong in mediaGenInput rather than
+// the legacy modelConfigOverride map. textToVideo / imageToVideo /
+// referenceToVideo share this envelope and differ only in mediaGenInput.
+func videoConversationPayload(prompt string, mediaGenInput map[string]any) map[string]any {
 	return map[string]any{
 		"modelName":            "imagine-video-gen",
-		"message":              prompt + " --mode=custom",
+		"message":              videoConversationMessage(prompt),
 		"enableImageStreaming": true,
 		"enableSideBySide":     true,
 		"sendFinalMetadata":    true,
@@ -604,14 +677,76 @@ func videoCreatePayload(prompt, ratio, resolution string, seconds int) map[strin
 				"modelMap": map[string]any{},
 			},
 		},
-		"mediaGenInput": map[string]any{
-			"textToVideo": map[string]any{
-				"prompt":         prompt,
-				"aspectRatio":    ratio,
-				"duration":       seconds,
-				"resolutionName": resolution,
-			},
+		"mediaGenInput": mediaGenInput,
+		"kind":          "CONVERSATION_KIND_IMAGINE",
+	}
+}
+
+// videoConversationMessage reproduces the browser "<prompt> --mode=custom"
+// message. 图生视频允许省略 prompt，此时不能留下前导空格。
+func videoConversationMessage(prompt string) string {
+	if strings.TrimSpace(prompt) == "" {
+		return "--mode=custom"
+	}
+	return prompt + " --mode=custom"
+}
+
+// videoCreatePayload 构造纯文生视频请求（保持既有抓包形状不变）。
+func videoCreatePayload(prompt, ratio, resolution string, seconds int) map[string]any {
+	return videoConversationPayload(prompt, map[string]any{
+		"textToVideo": map[string]any{
+			"prompt":         prompt,
+			"aspectRatio":    ratio,
+			"duration":       seconds,
+			"resolutionName": resolution,
 		},
-		"kind": "CONVERSATION_KIND_IMAGINE",
+	})
+}
+
+// imageToVideoPayload 构造单首帧请求。字段名与 grok.com 前端一致：
+// inputAssets 只放一张上传后的 asset id。前端默认省略 useFirstFrame（只有在
+// useFirstFrame === false 时才显式下发），这里显式写 true：语义相同，且在
+// 服务端把缺省值当 false 时也能保证首帧生效。
+func imageToVideoPayload(prompt, ratio, resolution string, seconds int, assetID string) map[string]any {
+	imageToVideo := map[string]any{
+		"inputAssets":    []any{assetID},
+		"aspectRatio":    ratio,
+		"duration":       seconds,
+		"resolutionName": resolution,
+		"useFirstFrame":  true,
+	}
+	// 图生视频的 prompt 在上游是可选字段。
+	if strings.TrimSpace(prompt) != "" {
+		imageToVideo["prompt"] = prompt
+	}
+	return videoConversationPayload(prompt, map[string]any{"imageToVideo": imageToVideo})
+}
+
+// referenceToVideoPayload 构造首尾帧请求，字段名精确对齐 grok.com 前端
+// buildReferenceToVideoInput：firstFrameAsset / lastFrameAsset 是图片上传返回的
+// asset id；inputAssets 固定为空数组（Web 视频没有风格参考槽位）。
+func referenceToVideoPayload(prompt, ratio, resolution string, seconds int, firstAssetID, lastAssetID string) map[string]any {
+	return videoConversationPayload(prompt, map[string]any{
+		"referenceToVideo": map[string]any{
+			"prompt":          prompt,
+			"inputAssets":     []any{},
+			"aspectRatio":     ratio,
+			"duration":        seconds,
+			"resolutionName":  resolution,
+			"firstFrameAsset": firstAssetID,
+			"lastFrameAsset":  lastAssetID,
+		},
+	})
+}
+
+// videoPayloadForFrames 依据上传成功的帧数量选择 mediaGenInput 变体。
+func videoPayloadForFrames(prompt, ratio, resolution string, seconds int, assets []string) map[string]any {
+	switch len(assets) {
+	case 0:
+		return videoCreatePayload(prompt, ratio, resolution, seconds)
+	case 1:
+		return imageToVideoPayload(prompt, ratio, resolution, seconds, assets[0])
+	default:
+		return referenceToVideoPayload(prompt, ratio, resolution, seconds, assets[0], assets[1])
 	}
 }
