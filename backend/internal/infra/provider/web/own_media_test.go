@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"net/http"
+	"net/url"
 	"sync/atomic"
 	"testing"
 
@@ -39,15 +41,16 @@ func (s *ownMediaAssetStore) OpenImage(_ context.Context, id string) (mediadomai
 		io.NopCloser(bytes.NewReader(s.data)), nil
 }
 
-// recordingOwnHostLoader 记录自有域名直连下载是否被调用，替代真实网络。
-type recordingOwnHostLoader struct {
+// recordingImageLoader 记录直连下载是否被调用，替代真实网络（也就断言了不经过
+// egress：egress 只在上传链路里使用）。
+type recordingImageLoader struct {
 	calls  int
 	rawURL string
 	image  provider.ImageInput
 	err    error
 }
 
-func (l *recordingOwnHostLoader) LoadOwnHostImage(_ context.Context, rawURL string, _ int64) (provider.ImageInput, error) {
+func (l *recordingImageLoader) LoadImage(_ context.Context, rawURL string, _ int64) (provider.ImageInput, error) {
 	l.calls++
 	l.rawURL = rawURL
 	return l.image, l.err
@@ -62,17 +65,17 @@ func testFramePNG(t *testing.T) []byte {
 	return image.Data
 }
 
-// newOwnMediaAdapter 构造注入了 ownHostImageLoader 桩的 adapter。自有媒体路径一旦
-// 意外走真实网络/出口代理，桩的调用计数与失败会立刻暴露出来。
-func newOwnMediaAdapter(t *testing.T, cfg Config, assets provider.ImageAssetStore) (*Adapter, *recordingOwnHostLoader, *security.Cipher) {
+// newOwnMediaAdapter 构造注入了 imageDirectLoader 桩的 adapter。图片下载一旦意外
+// 走真实网络/账号出口，桩的调用计数会立刻暴露出来。
+func newOwnMediaAdapter(t *testing.T, cfg Config, assets provider.ImageAssetStore) (*Adapter, *recordingImageLoader, *security.Cipher) {
 	t.Helper()
 	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	adapter := NewAdapter(cfg, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, assets)
-	loader := &recordingOwnHostLoader{image: provider.ImageInput{Filename: "remote.png", MIMEType: "image/png", Data: testFramePNG(t)}}
-	adapter.ownHostImages = loader
+	loader := &recordingImageLoader{image: provider.ImageInput{Filename: "remote.png", MIMEType: "image/png", Data: testFramePNG(t)}}
+	adapter.directImages = loader
 	return adapter, loader, cipher
 }
 
@@ -85,6 +88,17 @@ func ownMediaCredential(t *testing.T, cipher *security.Cipher) account.Credentia
 	return account.Credential{
 		ID: 1, Provider: account.ProviderWeb, WebTier: account.WebTierBasic,
 		EncryptedAccessToken: encrypted,
+	}
+}
+
+func TestDefaultAdapterUsesDirectImageLoader(t *testing.T) {
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewAdapter(Config{}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, &ownMediaAssetStore{})
+	if _, ok := adapter.directImages.(directImageLoader); !ok {
+		t.Fatalf("default image loader = %T, want directImageLoader", adapter.directImages)
 	}
 }
 
@@ -135,7 +149,7 @@ func TestLoadChatImagePrefersLocalMediaAsset(t *testing.T) {
 		t.Fatalf("opened = %#v, want [img_local]", store.opened)
 	}
 	if loader.calls != 0 {
-		t.Fatalf("own-host direct loader calls = %d, want 0 (local store hit)", loader.calls)
+		t.Fatalf("direct loader calls = %d, want 0 (local store hit)", loader.calls)
 	}
 }
 
@@ -170,28 +184,90 @@ func TestLoadChatImageOwnHostNonMediaPathGoesDirect(t *testing.T) {
 	}
 }
 
-func TestLoadChatImageExternalURLKeepsEgressPath(t *testing.T) {
+// 外部图床 URL 也必须直连：不再经过账号出口代理（lease 传 nil 也不能 panic）。
+func TestLoadChatImageExternalURLUsesDirectLoader(t *testing.T) {
 	adapter, loader, _ := newOwnMediaAdapter(t, Config{PublicBaseURL: "https://x.1so.org"}, &ownMediaAssetStore{})
-	// 外部私网地址必须在进入 egress 之前就被现有 SSRF 校验拒绝。
-	if _, err := adapter.loadChatImage(context.Background(), nil, "https://10.0.0.8/photo.png", 1<<20); err == nil {
-		t.Fatal("private external image URL was accepted")
+	image, err := adapter.loadChatImage(context.Background(), nil, "https://httpbin.org/image/png", 1<<20)
+	if err != nil {
+		t.Fatalf("loadChatImage: %v", err)
 	}
-	if loader.calls != 0 {
-		t.Fatalf("own-host loader calls = %d, want 0 for external URL", loader.calls)
+	if !bytes.Equal(image.Data, loader.image.Data) {
+		t.Fatalf("image = %#v", image)
+	}
+	if loader.calls != 1 || loader.rawURL != "https://httpbin.org/image/png" {
+		t.Fatalf("loader = %#v, want exactly one direct call", loader)
 	}
 }
 
-func TestDirectOwnHostImageLoaderRetainsSSRFValidation(t *testing.T) {
-	loader := directOwnHostImageLoader{}
+func TestLoadChatImageReportsDirectLoaderFailure(t *testing.T) {
+	adapter, loader, _ := newOwnMediaAdapter(t, Config{}, &ownMediaAssetStore{})
+	loader.err = errors.New("context deadline exceeded")
+	if _, err := adapter.loadChatImage(context.Background(), nil, "https://httpbin.org/image/png", 1<<20); err == nil {
+		t.Fatal("direct loader failure was swallowed")
+	}
+}
+
+func TestDirectImageLoaderRetainsSSRFValidation(t *testing.T) {
+	loader := directImageLoader{}
 	for _, rawURL := range []string{
 		"https://127.0.0.1/v1/media/images/img_abc",
-		"https://10.1.2.3/v1/media/images/img_abc",
-		"http://x.1so.org/v1/media/images/img_abc",
-		"https://x.1so.org:8443/v1/media/images/img_abc",
+		"https://10.1.2.3/photo.png",
+		"http://httpbin.org/image/png",
+		"https://httpbin.org:8443/image/png",
 	} {
-		if _, err := loader.LoadOwnHostImage(context.Background(), rawURL, 1<<20); err == nil {
-			t.Fatalf("%s was accepted by the direct own-host loader", rawURL)
+		if _, err := loader.LoadImage(context.Background(), rawURL, 1<<20); err == nil {
+			t.Fatalf("%s was accepted by the direct image loader", rawURL)
 		}
+	}
+}
+
+func TestReadDirectImageResponseRejectsRedirects(t *testing.T) {
+	source, err := url.Parse("https://picsum.photos/200")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect} {
+		response := &http.Response{
+			StatusCode: status, ContentLength: -1,
+			Header: http.Header{"Content-Type": []string{"text/html"}},
+			Body:   io.NopCloser(bytes.NewReader([]byte("redirect"))),
+		}
+		_, err := readDirectImageResponse(response, source, 1<<20)
+		if !errors.Is(err, errInvalidChatImage) {
+			t.Fatalf("status %d error = %v, want errInvalidChatImage", status, err)
+		}
+		if !bytes.Contains([]byte(err.Error()), []byte("重定向")) || !bytes.Contains([]byte(err.Error()), []byte("直链")) {
+			t.Fatalf("status %d error message = %q, want redirect/direct-link hint", status, err)
+		}
+	}
+}
+
+func TestReadDirectImageResponseStatusAndBodyValidation(t *testing.T) {
+	source, err := url.Parse("https://images.example.test/photo.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	notFound := &http.Response{StatusCode: http.StatusNotFound, ContentLength: -1, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}
+	if _, err := readDirectImageResponse(notFound, source, 1<<20); !errors.Is(err, errInvalidChatImage) {
+		t.Fatalf("404 error = %v, want errInvalidChatImage", err)
+	}
+	png := testFramePNG(t)
+	ok := &http.Response{
+		StatusCode: http.StatusOK, ContentLength: int64(len(png)),
+		Header: http.Header{"Content-Type": []string{"image/png"}},
+		Body:   io.NopCloser(bytes.NewReader(png)),
+	}
+	image, err := readDirectImageResponse(ok, source, 1<<20)
+	if err != nil || image.MIMEType != "image/png" || image.Filename != "photo.png" {
+		t.Fatalf("image = %#v err = %v", image, err)
+	}
+	oversized := &http.Response{
+		StatusCode: http.StatusOK, ContentLength: 2 << 20,
+		Header: http.Header{"Content-Type": []string{"image/png"}},
+		Body:   io.NopCloser(bytes.NewReader(png)),
+	}
+	if _, err := readDirectImageResponse(oversized, source, 1<<20); !errors.Is(err, errInvalidChatImage) {
+		t.Fatalf("oversized error = %v, want errInvalidChatImage", err)
 	}
 }
 
@@ -225,9 +301,44 @@ func TestGenerateVideoOwnMediaFrameSkipsNetworkDownload(t *testing.T) {
 		t.Fatalf("result = %#v", result)
 	}
 	if loader.calls != 0 {
-		t.Fatalf("own-host direct loader calls = %d, want 0", loader.calls)
+		t.Fatalf("direct loader calls = %d, want 0", loader.calls)
 	}
 	if uploads.Load() != 1 || generations.Load() != 1 {
 		t.Fatalf("uploads/generations = %d/%d, want 1/1", uploads.Load(), generations.Load())
+	}
+}
+
+// 外部图床首尾帧：帧图下载走直连（注入的 loader），上传仍走 grok 链路。
+func TestGenerateVideoExternalFrameUsesDirectLoader(t *testing.T) {
+	adapter, loader, cipher := newOwnMediaAdapter(t, Config{
+		StatsigMode: "manual", StatsigManualValue: "test",
+		VideoTimeoutSeconds: 5, FreeVideoDurationCap: 6, MaxInputImageBytes: 1 << 20,
+	}, &ownMediaAssetStore{})
+
+	var uploads, generations atomic.Int32
+	server := frameVideoServer(t, &uploads, &generations, nil)
+	defer server.Close()
+	adapter.UpdateConfig(Config{
+		BaseURL: server.URL, StatsigMode: "manual", StatsigManualValue: "test",
+		VideoTimeoutSeconds: 5, FreeVideoDurationCap: 6, MaxInputImageBytes: 1 << 20,
+	})
+
+	result, err := adapter.GenerateVideo(context.Background(), provider.VideoRequest{
+		Credential:    ownMediaCredential(t, cipher),
+		Prompt:        "transition",
+		Duration:      6,
+		ReferenceURLs: []string{"https://httpbin.org/image/png", "https://httpbin.org/image/jpeg"},
+	})
+	if err != nil {
+		t.Fatalf("GenerateVideo: %v", err)
+	}
+	if result.URL == "" {
+		t.Fatalf("result = %#v", result)
+	}
+	if loader.calls != 2 {
+		t.Fatalf("direct loader calls = %d, want 2 (one per frame)", loader.calls)
+	}
+	if uploads.Load() != 2 || generations.Load() != 1 {
+		t.Fatalf("uploads/generations = %d/%d, want 2/1", uploads.Load(), generations.Load())
 	}
 }

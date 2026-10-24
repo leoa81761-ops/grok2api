@@ -18,8 +18,8 @@ import (
 type Config struct {
 	BaseURL string
 	// PublicBaseURL 是本服务对外的公开地址（配置项 publicBaseURL）。
-	// 用于识别「帧图/参考图 URL 指向网关自己」的请求：这类下载必须优先读本地
-	// 媒体存储、否则直连，不能走账号出口代理。
+	// 用于识别「帧图/参考图 URL 指向网关自己」的请求：这类下载优先读本地媒体
+	// 存储（零网络）。所有非本地图片下载都走直连，不经过账号出口代理。
 	PublicBaseURL            string
 	StatsigMode              string
 	StatsigManualValue       string
@@ -43,15 +43,15 @@ type Adapter struct {
 	states          repository.ResponseRepository
 	assets          provider.ImageAssetStore
 	statsig         *statsigSigner
-	// ownHostImages 下载本服务自有域名上的图片（直连、不经出口代理）。
-	// 单测注入它来断言自有媒体 URL 不会进入 egress 链路。
-	ownHostImages ownHostImageLoader
-	logger        *slog.Logger
+	// directImages 下载所有非本地图片（直连、不经出口代理）。
+	// 单测注入它来断言图片下载不会进入 egress 链路。
+	directImages imageDirectLoader
+	logger       *slog.Logger
 }
 
 func NewAdapter(cfg Config, egress *infraegress.Manager, cipher *security.Cipher, states repository.ResponseRepository, assets provider.ImageAssetStore) *Adapter {
 	cfg = normalizedConfig(cfg)
-	return &Adapter{cfg: cfg, accountsBaseURL: officialAccountsBaseURL, egress: egress, cipher: cipher, states: states, assets: assets, statsig: newStatsigSigner(), ownHostImages: directOwnHostImageLoader{}, logger: slog.Default()}
+	return &Adapter{cfg: cfg, accountsBaseURL: officialAccountsBaseURL, egress: egress, cipher: cipher, states: states, assets: assets, statsig: newStatsigSigner(), directImages: directImageLoader{}, logger: slog.Default()}
 }
 
 func (a *Adapter) SetLogger(logger *slog.Logger) {

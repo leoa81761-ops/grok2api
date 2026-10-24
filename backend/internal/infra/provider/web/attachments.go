@@ -102,14 +102,14 @@ func (a *Adapter) prepareChatAttachments(ctx context.Context, cfg Config, lease 
 	return attachments, nil
 }
 
+// loadChatImage 解析对话/视频帧图片。下载一律直连（不经账号出口代理），
+// 只有后续「上传到 grok」的请求走 egress 租约。
 func (a *Adapter) loadChatImage(ctx context.Context, lease *egress.Lease, input string, maxBytes int64) (provider.ImageInput, error) {
 	if strings.HasPrefix(strings.ToLower(input), "data:") {
 		return parseChatImageDataURI(input, maxBytes)
 	}
-	// 本服务自己发布的图片（publicBaseURL + /v1/media/images/<id>）不进账号出口：
-	// 优先直接读本地媒体存储，没有本地副本时才直连下载。经出口代理访问自己的
-	// 公开域名会因代理侧 TLS 证书不匹配失败（生产实测），而且没必要把自家图片
-	// 的往返也挂到账号出口上。
+	// 本服务自己发布的图片（publicBaseURL + /v1/media/images/<id>）优先直接读本地
+	// 媒体存储（零网络）；本地没有副本时退回直连下载。
 	if assetID, ok := a.ownMediaImageAssetID(input); ok {
 		if image, found, err := a.loadLocalMediaImage(ctx, assetID, maxBytes); found {
 			if err != nil {
@@ -117,37 +117,17 @@ func (a *Adapter) loadChatImage(ctx context.Context, lease *egress.Lease, input 
 			}
 			return image, nil
 		}
-		return a.ownHostImages.LoadOwnHostImage(ctx, input, maxBytes)
 	}
-	if a.isOwnHostURL(input) {
-		return a.ownHostImages.LoadOwnHostImage(ctx, input, maxBytes)
-	}
-	target, err := validateRemoteImageURL(ctx, input)
-	if err != nil {
-		return provider.ImageInput{}, err
-	}
-	requestCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, target.fetchURL.String(), nil)
-	if err != nil {
-		return provider.ImageInput{}, err
-	}
-	request.Host = target.hostHeader
-	// 外部图片地址不接收 SSO 或 Cloudflare Cookie，避免把上游凭据泄漏给第三方。
-	request.Header = remoteImageHeaders(lease.UserAgent)
-	response, err := lease.DoPinnedHTTPS(request, target.serverName)
-	if err != nil {
-		return provider.ImageInput{}, fmt.Errorf("下载对话图片: %w", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return provider.ImageInput{}, fmt.Errorf("%w: 下载地址返回 %d", errInvalidChatImage, response.StatusCode)
-	}
-	return readImageResponse(response.Body, response.ContentLength, response.Header.Get("Content-Type"), target.originalURL, maxBytes)
+	// 其余图片（自有媒体的兜底、外部图床的首帧/尾帧、图片编辑参考图）统一直连：
+	// 下载帧图是网关自己的出站抓取，与 grok 账号 IP 无关，而 web 出口代理只为访问
+	// grok.com 设计，访问第三方站点既不可靠（实测出口节点 context deadline
+	// exceeded，主机直连 0.17s 200）也没有必要占用账号出口。参数 lease 仅供上传
+	// 链路使用，本函数刻意不使用它。
+	return a.directImages.LoadImage(ctx, input, maxBytes)
 }
 
-// readImageResponse 把已经建立的图片响应读成 ImageInput，统一做大小与格式校验；
-// 外部图片（经出口）与自有域名直连共用同一套约束。
+// readImageResponse 把已经建立的图片响应读成 ImageInput，统一做大小与格式校验。
+// 图片下载现在只有直连一条路径（自有媒体兜底与外部图床共用），约束保持不变。
 func readImageResponse(body io.Reader, contentLength int64, contentType string, source *url.URL, maxBytes int64) (provider.ImageInput, error) {
 	if contentLength > maxBytes {
 		return provider.ImageInput{}, fmt.Errorf("%w: 图片超过 %d MiB", errInvalidChatImage, maxBytes>>20)
