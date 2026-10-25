@@ -131,6 +131,12 @@ func (a *Adapter) SyncQuotaGroup(ctx context.Context, credential account.Credent
 		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
 		return provider.QuotaGroupSnapshot{}, fmt.Errorf("Grok Web Imagine 配额接口返回 %d", response.StatusCode)
 	}
+	// 记录上游配额原文（不含凭据），用于判断账号是否具备 480p/720p 视频资格。
+	preview := string(body)
+	if len(preview) > 1200 {
+		preview = preview[:1200]
+	}
+	a.log().Info("web_imagine_quota_raw", "account_id", credential.ID, "body", preview)
 	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
 	now := time.Now().UTC()
 	windows, err := decodeImagineQuotaSnapshot(body, credential.ID, now)
