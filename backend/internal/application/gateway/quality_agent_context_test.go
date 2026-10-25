@@ -27,8 +27,8 @@ func TestClassifyQualityHoldEmptyAgentContext(t *testing.T) {
 		{"tool call delivers", func(s *QualityStreamSignals) { s.SemanticOutput = true }, QualityDeliver},
 		{"reasoning delivers", func(s *QualityStreamSignals) { s.HasReasoningDelta = true; s.HasThinking = true }, QualityDeliver},
 		{"enough visible output delivers", func(s *QualityStreamSignals) { s.VisibleTokens = 200 }, QualityDeliver},
-		{"no tools declared falls back to plain rule", func(s *QualityStreamSignals) { s.ToolsDeclared = false }, QualityWait},
-		{"not terminal waits", func(s *QualityStreamSignals) { s.Terminal = false }, QualityWait},
+		{"no tools declared falls back to plain rule", func(s *QualityStreamSignals) { s.ToolsDeclared = false }, QualityWithhold},
+		{"not terminal waits", func(s *QualityStreamSignals) { s.Terminal = false; s.OutputTokens = 0 }, QualityWait},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
