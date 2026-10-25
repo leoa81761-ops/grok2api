@@ -679,18 +679,27 @@ func videoModeOverride(defaultMode string) string {
 	return defaultMode
 }
 
+// videoEnvelopeVariant 允许按环境变量切换请求信封字段组合，用于定位上游兜底
+// 演示素材的触发条件：
+//   - ""（默认）：保留 kind + enableImageStreaming（历史形状）
+//   - "min"   ：完全对齐浏览器 body（不含 kind / enableImageStreaming）
+//   - "nokind"：去掉 kind，保留 enableImageStreaming
+//   - "nostream"：去掉 enableImageStreaming，保留 kind
+func videoEnvelopeVariant() string {
+	return strings.TrimSpace(os.Getenv("GROK_WEB_VIDEO_VARIANT"))
+}
+
 // videoConversationPayload mirrors the current Grok Imagine browser request.
 // In particular, the generation parameters belong in mediaGenInput rather than
 // the legacy modelConfigOverride map. textToVideo / imageToVideo /
 // referenceToVideo share this envelope and differ only in mediaGenInput and the
 // --mode= marker carried inside message.
 func videoConversationPayload(prompt, mode string, mediaGenInput map[string]any) map[string]any {
-	return map[string]any{
-		"modelName":            "imagine-video-gen",
-		"message":              videoConversationMessage(prompt, mode),
-		"enableImageStreaming": true,
-		"enableSideBySide":     true,
-		"sendFinalMetadata":    true,
+	payload := map[string]any{
+		"modelName":         "imagine-video-gen",
+		"message":           videoConversationMessage(prompt, mode),
+		"enableSideBySide":  true,
+		"sendFinalMetadata": true,
 		"responseMetadata": map[string]any{
 			"experiments": []any{},
 			"modelConfigOverride": map[string]any{
@@ -698,8 +707,19 @@ func videoConversationPayload(prompt, mode string, mediaGenInput map[string]any)
 			},
 		},
 		"mediaGenInput": mediaGenInput,
-		"kind":          "CONVERSATION_KIND_IMAGINE",
 	}
+	switch videoEnvelopeVariant() {
+	case "min":
+		// 浏览器 video body 只有这几个字段。
+	case "nokind":
+		payload["enableImageStreaming"] = true
+	case "nostream":
+		payload["kind"] = "CONVERSATION_KIND_IMAGINE"
+	default:
+		payload["enableImageStreaming"] = true
+		payload["kind"] = "CONVERSATION_KIND_IMAGINE"
+	}
+	return payload
 }
 
 // videoConversationMessage reproduces the browser "<prompt> --mode=<t2v|i2v|r2v>"
