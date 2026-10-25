@@ -525,6 +525,8 @@ func qualityRetryRuntime(value config.QualityGuardConfig) gateway.QualityRetryRu
 		HardTPS:                          value.HardTPS,
 		MinGenerationMS:                  value.MinimumGenerationWindow.Value().Milliseconds(),
 		FailClosed:                       value.FailClosed,
+		AgentMinInputTokens:              int64(retry.AgentMinInputTokens),
+		AgentMinOutputTokens:             int64(retry.AgentMinOutputTokens),
 		DegradeAttributionEnabled:        retry.DegradeAttributionEnabled,
 		DegradationMode:                  retry.DegradationMode,
 		DegradeWindow:                    retry.DegradeWindow.Value(),

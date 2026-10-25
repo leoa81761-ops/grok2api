@@ -303,6 +303,12 @@ type QualityGuardRequestRetryConfig struct {
 	IdleAccountCooldown             Duration `yaml:"idleAccountCooldown"`
 	MinEncryptedBytes               int      `yaml:"minEncryptedBytes"`
 	EncryptedBytesPerReasoningToken int      `yaml:"encryptedBytesPerReasoningToken"`
+	// AgentMinInputTokens / AgentMinOutputTokens 控制「大上下文空转收尾」窄规则：
+	// 输入 ≥ AgentMinInputTokens 且可见输出 < AgentMinOutputTokens、声明了 tools
+	// 但没有工具调用与推理时，判为降智空回复并换号重试。零值用内置默认
+	// （100000 / 64）。
+	AgentMinInputTokens  int `yaml:"agentMinInputTokens"`
+	AgentMinOutputTokens int `yaml:"agentMinOutputTokens"`
 
 	// DegradeAttributionEnabled 把「质量守卫判定 Withhold」与「上游流式截断」两类
 	// 事件统一记为 degradation 事件，在内存滚动窗口内按账号/出口节点归因后分类
@@ -1066,6 +1072,7 @@ func defaultConfig() Config {
 				MaxAttempts: 6, HoldTimeout: Duration(30 * time.Second), MinOutputTokens: 8, OnExhausted: "fail_closed",
 				AccountCooldown: Duration(12 * time.Hour), IdleAccountCooldown: Duration(15 * time.Minute),
 				MinEncryptedBytes: 256, EncryptedBytesPerReasoningToken: 4,
+				AgentMinInputTokens: 100000, AgentMinOutputTokens: 64,
 				// 降智归因默认开启：线上 direct 出口 99% 请求没有推理，必须靠
 				// 账号×节点交叉证据区分「账号降智」与「出口节点降智」。
 				// 50k/500ms 分层参数来自 1 天线上定标，见

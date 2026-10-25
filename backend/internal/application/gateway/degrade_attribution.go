@@ -228,7 +228,8 @@ func newWithholdDegradationHit(credential accountdomain.Credential, trace *infra
 	// 只有 agent 空转窄规则是「形状命中」，需要按 gen_window/input 分层；
 	// 其余 Withhold（burst/cipher/missing-thinking）都是标签命中，一律入统计。
 	source := degradationSourceQualityWithhold
-	if evidence.WithholdRule == qualityWithholdRuleEmptyToolTurn {
+	if evidence.WithholdRule == qualityWithholdRuleEmptyToolTurn ||
+		evidence.WithholdRule == qualityWithholdRuleEmptyAgentContext {
 		source = degradationSourceAgentEmptyToolTurn
 	}
 	return degradationHit{

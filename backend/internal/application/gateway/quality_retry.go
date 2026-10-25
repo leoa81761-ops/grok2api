@@ -27,6 +27,12 @@ const (
 	defaultQualityMaxAttempts              = 6
 	defaultQualityHoldTimeout              = 30 * time.Second
 	defaultQualityMinOutput                = int64(8)
+	// 大上下文「空转收尾」窄规则：请求声明了 tools、上游没有工具调用、没有推理，
+	// 且上下文很大时，可见输出低于阈值即视为空回复。线上实测：输入 15–18 万
+	// token 的请求只回 33–63 token、reasoning=0，却被当成 200 成功交付，客户端
+	// 显示「已完成」但没有答案。
+	defaultAgentMinInputTokens  = int64(100_000)
+	defaultAgentMinOutputTokens = int64(64)
 	defaultMinEncryptedBytes               = 256
 	defaultEncryptedBytesPerReasoningToken = 4
 	defaultBurstFlushMS                    = int64(1000)
@@ -73,6 +79,11 @@ type QualityRetryRuntime struct {
 	HardTPS                         float64
 	MinGenerationMS                 int64
 	FailClosed                      bool
+	// AgentMinInputTokens / AgentMinOutputTokens 控制「大上下文空转收尾」窄规则：
+	// 输入 ≥ AgentMinInputTokens 且可见输出 < AgentMinOutputTokens、声明了 tools
+	// 但没有工具调用与推理时，判定为降智空回复并换号重试。
+	AgentMinInputTokens  int64
+	AgentMinOutputTokens int64
 	// DegradeAttributionEnabled 打开降智归因与分类处置。零值保持历史行为
 	// （每次 Withhold 无条件冷却/禁用账号），生产配置默认开启。
 	DegradeAttributionEnabled bool
@@ -128,6 +139,12 @@ type QualityStreamSignals struct {
 	// ToolsDeclared 表示请求体声明了非空 tools；DegradeEmptyToolTurn 是策略开关。
 	ToolsDeclared        bool
 	DegradeEmptyToolTurn bool
+	// InputTokens 是上游回报的输入 token（上下文规模）。
+	InputTokens int64
+	// AgentMinInputTokens / AgentMinOutputTokens 是「大上下文空转收尾」窄规则的
+	// 阈值，由 runtime 配置注入；零值表示使用内置默认。
+	AgentMinInputTokens  int64
+	AgentMinOutputTokens int64
 }
 
 // QualityVerdict is the hold decision for one upstream stream.
@@ -179,6 +196,12 @@ func normalizeQualityRetry(cfg QualityRetryRuntime) QualityRetryRuntime {
 	}
 	if cfg.MinGenerationMS <= 0 {
 		cfg.MinGenerationMS = audit.DefaultDegradeMinGenMS
+	}
+	if cfg.AgentMinInputTokens <= 0 {
+		cfg.AgentMinInputTokens = defaultAgentMinInputTokens
+	}
+	if cfg.AgentMinOutputTokens <= 0 {
+		cfg.AgentMinOutputTokens = defaultAgentMinOutputTokens
 	}
 	cfg.DegradationMode = normalizeDegradationMode(cfg.DegradationMode)
 	cfg.DegradeWindow = normalizeDegradeWindow(cfg.DegradeWindow)
@@ -348,6 +371,36 @@ func qualityIsEmptyToolTurn(sig QualityStreamSignals, minOutput int64) bool {
 	return sig.VisibleTokens < minOutput && sig.OutputTokens < minOutput
 }
 
+// qualityIsEmptyAgentContext 是「大上下文空转收尾」窄规则：
+//   - 请求声明了 tools（agent 回合），但流里没有出现任何工具调用/函数调用；
+//   - 没有任何推理证据；
+//   - 上下文规模 ≥ AgentMinInputTokens（默认 10 万 token）；
+//   - 可见输出 < AgentMinOutputTokens（默认 64 token）。
+//
+// 线上触发形态：输入 15–18 万 token、输出 33–63 token、reasoning=0，被当成
+// 200 成功交付，客户端显示「已完成」但正文为空。该规则只用于扣留换号，
+// 不改变普通短回复（上下文小或带工具调用）的交付。
+func qualityIsEmptyAgentContext(sig QualityStreamSignals) bool {
+	if !sig.ToolsDeclared || !sig.Terminal || sig.SemanticOutput {
+		return false
+	}
+	if sig.HasThinking || sig.HasReasoningDelta || sig.ReasoningTokens > 0 {
+		return false
+	}
+	minInput := sig.AgentMinInputTokens
+	if minInput <= 0 {
+		minInput = defaultAgentMinInputTokens
+	}
+	minOutput := sig.AgentMinOutputTokens
+	if minOutput <= 0 {
+		minOutput = defaultAgentMinOutputTokens
+	}
+	if sig.InputTokens < minInput {
+		return false
+	}
+	return sig.VisibleTokens < minOutput
+}
+
 // qualityWithholdRule 记录这次 Withhold 由哪条判定规则触发。降智归因用它区分
 // 「标签命中」（缺思考/截断，属于网关自身结论，一律计入统计）与「空转窄规则」
 // （形状命中，才需要按 gen_window/input 分层剔除测量伪影）。
@@ -361,6 +414,8 @@ const (
 	qualityWithholdRuleFastReasoning   qualityWithholdRule = "fast_reasoning_ratio"
 	qualityWithholdRuleMissingThinking qualityWithholdRule = "missing_thinking"
 	qualityWithholdRuleEmptyToolTurn   qualityWithholdRule = "empty_tool_turn"
+	// 大上下文空转收尾：输入很大、声明了 tools、没有工具调用与推理、可见输出极低。
+	qualityWithholdRuleEmptyAgentContext qualityWithholdRule = "empty_agent_context"
 )
 
 // ClassifyQualityHold decides whether a held stream may be forwarded.
@@ -390,6 +445,8 @@ func classifyQualityHold(sig QualityStreamSignals, minOutput int64) (QualityVerd
 		return QualityWithhold, qualityWithholdRuleFastReasoning
 	case qualityIsEmptyToolTurn(sig, minOutput):
 		return QualityWithhold, qualityWithholdRuleEmptyToolTurn
+	case qualityIsEmptyAgentContext(sig):
+		return QualityWithhold, qualityWithholdRuleEmptyAgentContext
 	}
 	if sig.HasThinking {
 		if sig.HasReasoningDelta {

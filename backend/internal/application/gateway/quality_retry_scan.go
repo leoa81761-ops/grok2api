@@ -41,6 +41,9 @@ type qualityScanState struct {
 	usage                           Usage
 	responseID                      string
 	terminal                        bool
+	// agentMinInputTokens / agentMinOutputTokens 是大上下文空转窄规则的阈值。
+	agentMinInputTokens  int64
+	agentMinOutputTokens int64
 	holdExpired                     bool
 	// withholdRule 记录本次 Withhold 的触发规则；降智归因据此区分
 	// 「标签命中」与「空转窄规则形状命中」。
@@ -180,6 +183,9 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		SemanticOutput:       s.semanticOutput,
 		ToolsDeclared:        s.toolsDeclared,
 		DegradeEmptyToolTurn: s.degradeEmptyToolTurn,
+		InputTokens:          s.usage.InputTokens,
+		AgentMinInputTokens:  s.agentMinInputTokens,
+		AgentMinOutputTokens: s.agentMinOutputTokens,
 	}
 }
 
@@ -551,6 +557,8 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 		minEncryptedBytes:               cfg.MinEncryptedBytes,
 		encryptedBytesPerReasoningToken: cfg.EncryptedBytesPerReasoningToken,
 		degradeEmptyToolTurn:            cfg.DegradeEmptyToolTurn,
+		agentMinInputTokens:             cfg.AgentMinInputTokens,
+		agentMinOutputTokens:            cfg.AgentMinOutputTokens,
 	}
 	if option != nil {
 		state.toolsDeclared = option.ToolsDeclared
