@@ -292,7 +292,9 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 			"frame_count", len(assets), "duration", segments[0], "resolution", resolution)
 	}
 	payload := videoPayloadForFrames(request.Prompt, ratio, resolution, segments[0], assets)
-	response, err := a.postJSON(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
+	// 浏览器在 Imagine 页发起视频生成时会带 Referer=/imagine；缺这个头时上游
+	// 会把请求当成非页面来源并返回与提示词无关的演示素材（与图片编辑一致）。
+	response, err := a.postJSONWithReferer(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second, cfg.BaseURL+"/imagine")
 	if err != nil {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
 	}
