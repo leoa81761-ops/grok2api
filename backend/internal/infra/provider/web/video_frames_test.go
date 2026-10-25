@@ -68,17 +68,17 @@ func TestVideoPayloadShapesMatchFrontendMediaGenInput(t *testing.T) {
 		{
 			name:    "text to video keeps captured shape",
 			payload: videoPayloadForFrames("雨后天晴！", "9:16", "480p", 6, nil),
-			want:    `{"enableImageStreaming":true,"enableSideBySide":true,"kind":"CONVERSATION_KIND_IMAGINE","mediaGenInput":{"textToVideo":{"aspectRatio":"9:16","duration":6,"prompt":"雨后天晴！","resolutionName":"480p"}},"message":"雨后天晴！ --mode=custom","modelName":"imagine-video-gen","responseMetadata":{"experiments":[],"modelConfigOverride":{"modelMap":{}}},"sendFinalMetadata":true}`,
+			want:    `{"enableImageStreaming":true,"enableSideBySide":true,"kind":"CONVERSATION_KIND_IMAGINE","mediaGenInput":{"textToVideo":{"aspectRatio":"9:16","duration":6,"prompt":"雨后天晴！","resolutionName":"480p"}},"message":"雨后天晴！ --mode=t2v","modelName":"imagine-video-gen","responseMetadata":{"experiments":[],"modelConfigOverride":{"modelMap":{}}},"sendFinalMetadata":true}`,
 		},
 		{
 			name:    "single frame uses imageToVideo with useFirstFrame",
 			payload: videoPayloadForFrames("镜头推进", "16:9", "480p", 6, []string{"asset-first"}),
-			want:    `{"enableImageStreaming":true,"enableSideBySide":true,"kind":"CONVERSATION_KIND_IMAGINE","mediaGenInput":{"imageToVideo":{"aspectRatio":"16:9","duration":6,"inputAssets":["asset-first"],"prompt":"镜头推进","resolutionName":"480p","useFirstFrame":true}},"message":"镜头推进 --mode=custom","modelName":"imagine-video-gen","responseMetadata":{"experiments":[],"modelConfigOverride":{"modelMap":{}}},"sendFinalMetadata":true}`,
+			want:    `{"enableImageStreaming":true,"enableSideBySide":true,"kind":"CONVERSATION_KIND_IMAGINE","mediaGenInput":{"imageToVideo":{"aspectRatio":"16:9","duration":6,"inputAssets":["asset-first"],"prompt":"镜头推进","resolutionName":"480p","useFirstFrame":true}},"message":"镜头推进 --mode=i2v","modelName":"imagine-video-gen","responseMetadata":{"experiments":[],"modelConfigOverride":{"modelMap":{}}},"sendFinalMetadata":true}`,
 		},
 		{
 			name:    "first and last frame use referenceToVideo asset fields",
 			payload: videoPayloadForFrames("从白天到黑夜", "16:9", "480p", 6, []string{"asset-first", "asset-last"}),
-			want:    `{"enableImageStreaming":true,"enableSideBySide":true,"kind":"CONVERSATION_KIND_IMAGINE","mediaGenInput":{"referenceToVideo":{"aspectRatio":"16:9","duration":6,"firstFrameAsset":"asset-first","inputAssets":[],"lastFrameAsset":"asset-last","prompt":"从白天到黑夜","resolutionName":"480p"}},"message":"从白天到黑夜 --mode=custom","modelName":"imagine-video-gen","responseMetadata":{"experiments":[],"modelConfigOverride":{"modelMap":{}}},"sendFinalMetadata":true}`,
+			want:    `{"enableImageStreaming":true,"enableSideBySide":true,"kind":"CONVERSATION_KIND_IMAGINE","mediaGenInput":{"referenceToVideo":{"aspectRatio":"16:9","duration":6,"firstFrameAsset":"asset-first","inputAssets":[],"lastFrameAsset":"asset-last","prompt":"从白天到黑夜","resolutionName":"480p"}},"message":"从白天到黑夜 --mode=r2v","modelName":"imagine-video-gen","responseMetadata":{"experiments":[],"modelConfigOverride":{"modelMap":{}}},"sendFinalMetadata":true}`,
 		},
 	}
 	for _, test := range tests {
@@ -97,8 +97,8 @@ func TestVideoPayloadShapesMatchFrontendMediaGenInput(t *testing.T) {
 func TestImageToVideoPayloadOmitsEmptyPrompt(t *testing.T) {
 	payload := imageToVideoPayload("", "1:1", "480p", 6, "asset-first")
 	message := payload["message"]
-	if message != "--mode=custom" {
-		t.Fatalf("message = %#v, want --mode=custom", message)
+	if message != "--mode=i2v" {
+		t.Fatalf("message = %#v, want --mode=i2v", message)
 	}
 	imageToVideo, _ := payload["mediaGenInput"].(map[string]any)["imageToVideo"].(map[string]any)
 	if _, exists := imageToVideo["prompt"]; exists {
@@ -185,7 +185,7 @@ func TestGenerateVideoFirstLastFrameUploadsBothFramesAndSendsReferenceToVideo(t 
 	if err := json.Unmarshal(captured, &payload); err != nil {
 		t.Fatalf("decode payload %s: %v", captured, err)
 	}
-	if payload["modelName"] != "imagine-video-gen" || payload["message"] != "从白天到黑夜 --mode=custom" {
+	if payload["modelName"] != "imagine-video-gen" || payload["message"] != "从白天到黑夜 --mode=r2v" {
 		t.Fatalf("payload = %#v", payload)
 	}
 	mediaGenInput, _ := payload["mediaGenInput"].(map[string]any)

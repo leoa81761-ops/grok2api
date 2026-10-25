@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -660,14 +661,33 @@ func (a *Adapter) uploadVideoFrames(ctx context.Context, cfg Config, lease *infr
 	return assets, nil
 }
 
+// videoModeTextToVideo / videoModeImageToVideo / videoModeReferenceToVideo 是
+// grok.com 前端 omniVideoMode 的三个真实取值，会写进 message 的 --mode= 后缀。
+// 旧实现写死 --mode=custom，上游识别不了该模式，会返回与提示词无关的演示素材
+// （实测「红苹果」→ 室内猫/秋日森林），因此必须按生成类型下发真实模式名。
+const (
+	videoModeTextToVideo      = "t2v"
+	videoModeImageToVideo     = "i2v"
+	videoModeReferenceToVideo = "r2v"
+)
+
+// videoModeOverride 允许通过环境变量临时验证不同模式名（排障用）。
+func videoModeOverride(defaultMode string) string {
+	if value := strings.TrimSpace(os.Getenv("GROK_WEB_VIDEO_MODE")); value != "" {
+		return value
+	}
+	return defaultMode
+}
+
 // videoConversationPayload mirrors the current Grok Imagine browser request.
 // In particular, the generation parameters belong in mediaGenInput rather than
 // the legacy modelConfigOverride map. textToVideo / imageToVideo /
-// referenceToVideo share this envelope and differ only in mediaGenInput.
-func videoConversationPayload(prompt string, mediaGenInput map[string]any) map[string]any {
+// referenceToVideo share this envelope and differ only in mediaGenInput and the
+// --mode= marker carried inside message.
+func videoConversationPayload(prompt, mode string, mediaGenInput map[string]any) map[string]any {
 	return map[string]any{
 		"modelName":            "imagine-video-gen",
-		"message":              videoConversationMessage(prompt),
+		"message":              videoConversationMessage(prompt, mode),
 		"enableImageStreaming": true,
 		"enableSideBySide":     true,
 		"sendFinalMetadata":    true,
@@ -682,18 +702,22 @@ func videoConversationPayload(prompt string, mediaGenInput map[string]any) map[s
 	}
 }
 
-// videoConversationMessage reproduces the browser "<prompt> --mode=custom"
+// videoConversationMessage reproduces the browser "<prompt> --mode=<t2v|i2v|r2v>"
 // message. 图生视频允许省略 prompt，此时不能留下前导空格。
-func videoConversationMessage(prompt string) string {
-	if strings.TrimSpace(prompt) == "" {
-		return "--mode=custom"
+func videoConversationMessage(prompt, mode string) string {
+	if strings.TrimSpace(mode) == "" {
+		mode = videoModeTextToVideo
 	}
-	return prompt + " --mode=custom"
+	mode = videoModeOverride(mode)
+	if strings.TrimSpace(prompt) == "" {
+		return "--mode=" + mode
+	}
+	return prompt + " --mode=" + mode
 }
 
 // videoCreatePayload 构造纯文生视频请求（保持既有抓包形状不变）。
 func videoCreatePayload(prompt, ratio, resolution string, seconds int) map[string]any {
-	return videoConversationPayload(prompt, map[string]any{
+	return videoConversationPayload(prompt, videoModeTextToVideo, map[string]any{
 		"textToVideo": map[string]any{
 			"prompt":         prompt,
 			"aspectRatio":    ratio,
@@ -719,14 +743,14 @@ func imageToVideoPayload(prompt, ratio, resolution string, seconds int, assetID 
 	if strings.TrimSpace(prompt) != "" {
 		imageToVideo["prompt"] = prompt
 	}
-	return videoConversationPayload(prompt, map[string]any{"imageToVideo": imageToVideo})
+	return videoConversationPayload(prompt, videoModeImageToVideo, map[string]any{"imageToVideo": imageToVideo})
 }
 
 // referenceToVideoPayload 构造首尾帧请求，字段名精确对齐 grok.com 前端
 // buildReferenceToVideoInput：firstFrameAsset / lastFrameAsset 是图片上传返回的
 // asset id；inputAssets 固定为空数组（Web 视频没有风格参考槽位）。
 func referenceToVideoPayload(prompt, ratio, resolution string, seconds int, firstAssetID, lastAssetID string) map[string]any {
-	return videoConversationPayload(prompt, map[string]any{
+	return videoConversationPayload(prompt, videoModeReferenceToVideo, map[string]any{
 		"referenceToVideo": map[string]any{
 			"prompt":          prompt,
 			"inputAssets":     []any{},

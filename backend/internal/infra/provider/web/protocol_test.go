@@ -1551,7 +1551,7 @@ func TestParseVideoStreamFixture(t *testing.T) {
 func TestTextToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) {
 	payload := videoCreatePayload("雨后天晴！", "9:16", "480p", 6)
 	if len(payload) != 8 || payload["modelName"] != "imagine-video-gen" ||
-		payload["message"] != "雨后天晴！ --mode=custom" ||
+		payload["message"] != "雨后天晴！ --mode=t2v" ||
 		payload["enableImageStreaming"] != true || payload["enableSideBySide"] != true ||
 		payload["sendFinalMetadata"] != true || payload["kind"] != "CONVERSATION_KIND_IMAGINE" {
 		t.Fatalf("payload = %#v", payload)
