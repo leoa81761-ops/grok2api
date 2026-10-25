@@ -698,13 +698,10 @@ func videoEnvelopeVariant() string {
 // --mode= marker carried inside message.
 func videoConversationPayload(prompt, mode string, mediaGenInput map[string]any) map[string]any {
 	payload := map[string]any{
-		"modelName": "imagine-video-gen",
-		"message":   videoConversationMessage(prompt, mode),
-		// enableImageGeneration 是上游媒体生成的开关：浏览器正常生成图片/视频时
-		// 必带。只带 enableImageStreaming 时上游会回与提示词无关的演示素材。
-		"enableImageGeneration": true,
-		"enableSideBySide":      true,
-		"sendFinalMetadata":     true,
+		"modelName":         "imagine-video-gen",
+		"message":           videoConversationMessage(prompt, mode),
+		"enableSideBySide":  true,
+		"sendFinalMetadata": true,
 		"responseMetadata": map[string]any{
 			"experiments": []any{},
 			"modelConfigOverride": map[string]any{
