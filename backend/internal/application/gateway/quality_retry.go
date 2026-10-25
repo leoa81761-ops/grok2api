@@ -84,6 +84,9 @@ type QualityRetryRuntime struct {
 	// 但没有工具调用与推理时，判定为降智空回复并换号重试。
 	AgentMinInputTokens  int64
 	AgentMinOutputTokens int64
+	// AbortHoldTimeoutNoOutput 打开后，持流到期且上游完全没有可见输出时立即
+	// 按空流失败（换号重试/快速 504），避免下游空闲到被客户端掐断。
+	AbortHoldTimeoutNoOutput bool
 	// DegradeAttributionEnabled 打开降智归因与分类处置。零值保持历史行为
 	// （每次 Withhold 无条件冷却/禁用账号），生产配置默认开启。
 	DegradeAttributionEnabled bool

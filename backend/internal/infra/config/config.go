@@ -309,6 +309,9 @@ type QualityGuardRequestRetryConfig struct {
 	// （100000 / 64）。
 	AgentMinInputTokens  int `yaml:"agentMinInputTokens"`
 	AgentMinOutputTokens int `yaml:"agentMinOutputTokens"`
+	// AbortHoldTimeoutNoOutput 打开后，持流到期且上游完全没有可见输出时立即按
+	// 空流失败（换号重试或快速 504），避免下游长时间零字节被客户端掐断。
+	AbortHoldTimeoutNoOutput bool `yaml:"abortHoldTimeoutNoOutput"`
 
 	// DegradeAttributionEnabled 把「质量守卫判定 Withhold」与「上游流式截断」两类
 	// 事件统一记为 degradation 事件，在内存滚动窗口内按账号/出口节点归因后分类

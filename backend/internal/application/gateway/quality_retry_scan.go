@@ -591,6 +591,17 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 				state.withholdRule = rule
 				return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
 			}
+			// 持流到期且上游连一个可见 token 都没有：继续 Wait 会让下游在
+			// 60s 级空闲后被客户端/中间层掐断（线上 client_stream_interrupted
+			// ≈62s、output=0）。开关打开时改为立即按空流失败处理，让网关换号
+			// 重试或快速返回 504，客户端拿到明确错误而不是“假完成”。
+			if cfg.AbortHoldTimeoutNoOutput &&
+				sig.VisibleTokens <= 0 && sig.OutputTokens <= 0 && !sig.SemanticOutput {
+				_ = pump.Close()
+				state.withholdRule = qualityWithholdRuleNone
+				return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait,
+					state.usage, state.responseID, errQualityEmptyStream
+			}
 		case result, ok := <-pump.results:
 			if !ok {
 				return finishQualityPeek(&held, pump, &state, cfg)

@@ -527,6 +527,7 @@ func qualityRetryRuntime(value config.QualityGuardConfig) gateway.QualityRetryRu
 		FailClosed:                       value.FailClosed,
 		AgentMinInputTokens:              int64(retry.AgentMinInputTokens),
 		AgentMinOutputTokens:             int64(retry.AgentMinOutputTokens),
+		AbortHoldTimeoutNoOutput:         retry.AbortHoldTimeoutNoOutput,
 		DegradeAttributionEnabled:        retry.DegradeAttributionEnabled,
 		DegradationMode:                  retry.DegradationMode,
 		DegradeWindow:                    retry.DegradeWindow.Value(),

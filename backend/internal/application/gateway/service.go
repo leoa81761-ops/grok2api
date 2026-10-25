@@ -1052,6 +1052,10 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	// qualityDegradedSeen 记录本次请求已确认过退化响应；重试期间候选全部冷却时
 	// 用它返回 quality_degraded_no_account，而不是退回劣质响应冒充 200。
 	qualityDegradedSeen := false
+	// emptyPeekAttempts 统计「持流到期但上游零输出」的连续次数。两次之后就不再
+	// 继续换号：继续等待只会让下游长时间零字节，最终被客户端以
+	// client_stream_interrupted 掐断（线上实测 ≈62s、output=0）。
+	emptyPeekAttempts := 0
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
 	quotaProbeAttempted := false
 	selection := preselectedSession
@@ -1654,6 +1658,13 @@ attemptLoop:
 							s.logger.Warn(logPrefix+"_retry", "request_id", input.RequestID, "account_id", credential.ID, "cooldown", holdCfg.IdleAccountCooldown)
 						}
 						writeCancel()
+					}
+					if errors.Is(peekErr, errQualityEmptyStream) && holdCfg.AbortHoldTimeoutNoOutput {
+						emptyPeekAttempts++
+						if emptyPeekAttempts >= 2 {
+							s.logger.Warn("quality_peek_empty_abort", "request_id", input.RequestID, "attempts", emptyPeekAttempts)
+							break
+						}
 					}
 					if !qualityCrossAccountReplay || shouldStopForNonAccountFingerprint(failureFingerprints, lastFailure) {
 						break
