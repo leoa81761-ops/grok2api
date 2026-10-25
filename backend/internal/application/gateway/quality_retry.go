@@ -430,11 +430,7 @@ func classifyQualityHold(sig QualityStreamSignals, minOutput int64) (QualityVerd
 	}
 	if sig.Terminal {
 		if output <= 0 {
-			// 终态没有任何可见内容：这是上游被降智后返回的空回复（线上实测
-			// 15–18 万 token 上下文的请求只回 33–63 token 且无推理）。必须扣留
-			// 并换号重试；以前返回 Wait 会让空响应最终原样交付，客户端把它当
-			// 成“已完成”的假成功。
-			return QualityWithhold, qualityWithholdRuleMissingThinking
+			return QualityWait, qualityWithholdRuleNone
 		}
 		if enough {
 			return QualityWithhold, qualityWithholdRuleMissingThinking
@@ -446,8 +442,7 @@ func classifyQualityHold(sig QualityStreamSignals, minOutput int64) (QualityVerd
 	}
 	if sig.HoldExpired {
 		if output <= 0 {
-			// 同上：扣留超时且仍无可见内容，按降智处理而不是放行空响应。
-			return QualityWithhold, qualityWithholdRuleMissingThinking
+			return QualityWait, qualityWithholdRuleNone
 		}
 		if enough {
 			return QualityWithhold, qualityWithholdRuleMissingThinking
