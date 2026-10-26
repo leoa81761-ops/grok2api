@@ -395,10 +395,14 @@ func qualityIsDegenerateLoop(sig QualityStreamSignals) bool {
 	if sig.HasReasoningDelta || sig.HasThinking || sig.SemanticOutput {
 		return false
 	}
-	if sig.VisibleTokens < 128 {
+	if sig.VisibleTokens < 128 || sig.RepeatMax < 50 {
 		return false
 	}
-	return sig.RepeatMax >= 12
+	// Coverage guard: the repeated window must account for at least a quarter
+	// of the visible answer. VisibleTokens is runes/4, so one RepeatMax window
+	// of repeatWindowRunes runes covers 25% exactly when
+	// RepeatMax*repeatWindowRunes == VisibleTokens.
+	return int64(sig.RepeatMax)*int64(repeatWindowRunes) >= sig.VisibleTokens
 }
 
 func qualityIsEmptyAgentContext(sig QualityStreamSignals) bool {
