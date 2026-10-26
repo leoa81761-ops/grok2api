@@ -218,7 +218,7 @@ qualityGuard:
 		t.Fatalf("qualityGuard = %#v", value.QualityGuard)
 	}
 	retry := value.QualityGuard.RequestRetry
-	if !retry.Enabled || !retry.AutoDisable || retry.MaxAttempts != 6 || retry.HoldTimeout.Value() != 30*time.Second || retry.MinOutputTokens != 8 || retry.OnExhausted != "fail_closed" || retry.AccountCooldown.Value() != 12*time.Hour || retry.IdleAccountCooldown.Value() != 15*time.Minute {
+	if !retry.Enabled || !retry.AutoDisable || retry.MaxAttempts != 6 || retry.HoldTimeout.Value() != 90*time.Second || retry.MinOutputTokens != 8 || retry.OnExhausted != "fail_closed" || retry.AccountCooldown.Value() != 12*time.Hour || retry.IdleAccountCooldown.Value() != 15*time.Minute {
 		t.Fatalf("loaded requestRetry defaults = %#v", retry)
 	}
 }
@@ -226,7 +226,7 @@ qualityGuard:
 func TestDefaultQualityGuardRequestRetryContract(t *testing.T) {
 	t.Parallel()
 	got := defaultConfig().QualityGuard.RequestRetry
-	if got.Enabled || got.AutoDisable || got.MaxAttempts != 6 || got.HoldTimeout.Value() != 30*time.Second || got.MinOutputTokens != 8 || got.OnExhausted != "fail_closed" || got.AccountCooldown.Value() != 12*time.Hour || got.IdleAccountCooldown.Value() != 15*time.Minute || got.MinEncryptedBytes != 256 || got.EncryptedBytesPerReasoningToken != 4 {
+	if got.Enabled || got.AutoDisable || got.MaxAttempts != 6 || got.HoldTimeout.Value() != 90*time.Second || got.MinOutputTokens != 8 || got.OnExhausted != "fail_closed" || got.AccountCooldown.Value() != 12*time.Hour || got.IdleAccountCooldown.Value() != 15*time.Minute || got.MinEncryptedBytes != 256 || got.EncryptedBytesPerReasoningToken != 4 {
 		t.Fatalf("requestRetry defaults = %#v", got)
 	}
 }
@@ -243,7 +243,7 @@ func TestAutoDisableValidatesRequestPolicyWithoutSidecar(t *testing.T) {
 		change func(*QualityGuardConfig)
 	}{
 		{"retry limit", func(c *QualityGuardConfig) { c.RequestRetry.MaxAttempts = 7 }},
-		{"hold timeout", func(c *QualityGuardConfig) { c.RequestRetry.HoldTimeout = Duration(time.Minute) }},
+		{"hold timeout", func(c *QualityGuardConfig) { c.RequestRetry.HoldTimeout = Duration(2 * time.Minute) }},
 		{"output floor", func(c *QualityGuardConfig) { c.RequestRetry.MinOutputTokens = 1 }},
 		{"soft TPS", func(c *QualityGuardConfig) { c.SoftTPS = 0 }},
 		{"hard TPS", func(c *QualityGuardConfig) { c.HardTPS = c.SoftTPS }},
