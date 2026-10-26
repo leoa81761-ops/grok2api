@@ -49,6 +49,11 @@ type qualityScanState struct {
 	// 「标签命中」与「空转窄规则形状命中」。
 	withholdRule   qualityWithholdRule
 	firstVisibleAt time.Time
+	// repeatTail/repeatCounts/repeatMax 记录可见正文里 24 字符窗口的重复次数，
+	// 用于识别 mode-collapse 复读；只保留滑动尾窗，不保留正文。
+	repeatTail   []rune
+	repeatCounts map[string]int
+	repeatMax    int
 }
 
 type qualityReadResult struct {
@@ -186,6 +191,7 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		InputTokens:          s.usage.InputTokens,
 		AgentMinInputTokens:  s.agentMinInputTokens,
 		AgentMinOutputTokens: s.agentMinOutputTokens,
+		RepeatMax:            s.repeatMax,
 	}
 }
 
@@ -499,6 +505,11 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 	}
 }
 
+const (
+	repeatWindowRunes = 24
+	repeatWindowCap   = 20000
+)
+
 func noteVisibleContent(state *qualityScanState, text string) {
 	if text == "" {
 		return
@@ -507,6 +518,37 @@ func noteVisibleContent(state *qualityScanState, text string) {
 		state.firstVisibleAt = time.Now()
 	}
 	state.visibleRunes += utf8.RuneCountInString(text)
+	noteRepeatWindows(state, text)
+}
+
+// noteRepeatWindows counts recurring 24-rune windows in the visible text so
+// a mode-collapse loop is detectable from counts alone. Only the sliding
+// tail is retained; the map is capped to bound memory on huge answers.
+func noteRepeatWindows(state *qualityScanState, text string) {
+	if state.repeatCounts == nil {
+		state.repeatCounts = make(map[string]int, 256)
+	}
+	for _, r := range text {
+		state.repeatTail = append(state.repeatTail, r)
+		if len(state.repeatTail) < repeatWindowRunes {
+			continue
+		}
+		if len(state.repeatTail) > repeatWindowRunes {
+			state.repeatTail = state.repeatTail[len(state.repeatTail)-repeatWindowRunes:]
+		}
+		key := string(state.repeatTail)
+		if count, ok := state.repeatCounts[key]; ok {
+			count++
+			state.repeatCounts[key] = count
+			if count > state.repeatMax {
+				state.repeatMax = count
+			}
+			continue
+		}
+		if len(state.repeatCounts) < repeatWindowCap {
+			state.repeatCounts[key] = 1
+		}
+	}
 }
 
 // QualityStreamEvidence 是 peek 结束时回传的质量证据，只用于降智归因，

@@ -25,7 +25,7 @@ const (
 	qualityRetryFailOpen                   = "fail_open"
 	qualityRetryFailClosed                 = "fail_closed"
 	defaultQualityMaxAttempts              = 6
-	defaultQualityHoldTimeout              = 30 * time.Second
+	defaultQualityHoldTimeout              = 90 * time.Second
 	defaultQualityMinOutput                = int64(8)
 	// 大上下文「空转收尾」窄规则：请求声明了 tools、上游没有工具调用、没有推理，
 	// 且上下文很大时，可见输出低于阈值即视为空回复。线上实测：输入 15–18 万
@@ -128,6 +128,9 @@ type QualityStreamSignals struct {
 	// still emits the stub, then dumps visible tokens with usage 0.
 	ReasoningStarted bool
 	VisibleTokens    int64
+	// RepeatMax 是可见正文里同一个 24 字符窗口的最大重复次数，用于识别
+	// mode-collapse 复读（4.7 Build 通道 32k 复读事故的形状特征）。
+	RepeatMax int
 	ReasoningTokens  int64
 	OutputTokens     int64
 	EncryptedBytes   int
@@ -383,6 +386,21 @@ func qualityIsEmptyToolTurn(sig QualityStreamSignals, minOutput int64) bool {
 // 线上触发形态：输入 15–18 万 token、输出 33–63 token、reasoning=0，被当成
 // 200 成功交付，客户端显示「已完成」但正文为空。该规则只用于扣留换号，
 // 不改变普通短回复（上下文小或带工具调用）的交付。
+// qualityIsDegenerateLoop catches mode collapse: the model repeats one
+// sentence until the output cap. Shape: no thinking evidence, no tool call,
+// a non-trivial visible answer, and the same 24-rune window repeated many
+// times. Context size does not exempt it (4.7 Build agent turns hit this at
+// 93k-164k input with ~74k characters of repeated prose, stopReason=length).
+func qualityIsDegenerateLoop(sig QualityStreamSignals) bool {
+	if sig.HasReasoningDelta || sig.HasThinking || sig.SemanticOutput {
+		return false
+	}
+	if sig.VisibleTokens < 128 {
+		return false
+	}
+	return sig.RepeatMax >= 12
+}
+
 func qualityIsEmptyAgentContext(sig QualityStreamSignals) bool {
 	if !sig.ToolsDeclared || !sig.Terminal || sig.SemanticOutput {
 		return false
@@ -417,6 +435,7 @@ const (
 	qualityWithholdRuleFastReasoning   qualityWithholdRule = "fast_reasoning_ratio"
 	qualityWithholdRuleMissingThinking qualityWithholdRule = "missing_thinking"
 	qualityWithholdRuleEmptyToolTurn   qualityWithholdRule = "empty_tool_turn"
+	qualityWithholdRuleDegenerateLoop  qualityWithholdRule = "degenerate_loop"
 	// 大上下文空转收尾：输入很大、声明了 tools、没有工具调用与推理、可见输出极低。
 	qualityWithholdRuleEmptyAgentContext qualityWithholdRule = "empty_agent_context"
 )
@@ -446,6 +465,8 @@ func classifyQualityHold(sig QualityStreamSignals, minOutput int64) (QualityVerd
 		return QualityWithhold, qualityWithholdRuleFakeEncrypted
 	case qualityIsFastReasoningRatioDump(sig):
 		return QualityWithhold, qualityWithholdRuleFastReasoning
+	case qualityIsDegenerateLoop(sig):
+		return QualityWithhold, qualityWithholdRuleDegenerateLoop
 	case qualityIsEmptyToolTurn(sig, minOutput):
 		return QualityWithhold, qualityWithholdRuleEmptyToolTurn
 	case qualityIsEmptyAgentContext(sig):
